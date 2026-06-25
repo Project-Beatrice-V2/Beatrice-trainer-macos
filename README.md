@@ -83,6 +83,21 @@ When you select a speaker dataset in the **Training** tab, the system runs deep 
 
 ---
 
+## Screenshots
+
+<table width="100%">
+  <tr>
+    <td width="50%" align="center"><b>Dashboard</b><br/><img src="assets/dashboard.png" width="100%"/></td>
+    <td width="50%" align="center"><b>Dataset Manager</b><br/><img src="assets/dataset.png" width="100%"/></td>
+  </tr>
+  <tr>
+    <td width="50%" align="center"><b>Training Configuration</b><br/><img src="assets/training.png" width="100%"/></td>
+    <td width="50%" align="center"><b>Trained Models</b><br/><img src="assets/models.png" width="100%"/></td>
+  </tr>
+</table>
+
+---
+
 ## Contributing & License
 
 Feel free to open issues or pull requests. Project Beatrice V2 Voice Trainer is licensed under the [MIT License](LICENSE).
