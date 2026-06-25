@@ -24,6 +24,21 @@ A premium, hardware-aware desktop Web interface for training custom voice conver
 
 ---
 
+## Screenshots
+
+<table width="100%">
+  <tr>
+    <td width="50%" align="center"><b>Dashboard</b><br/><img src="assets/dashboard.png" width="100%"/></td>
+    <td width="50%" align="center"><b>Dataset Manager</b><br/><img src="assets/dataset.png" width="100%"/></td>
+  </tr>
+  <tr>
+    <td width="50%" align="center"><b>Training Configuration</b><br/><img src="assets/training.png" width="100%"/></td>
+    <td width="50%" align="center"><b>Trained Models</b><br/><img src="assets/models.png" width="100%"/></td>
+  </tr>
+</table>
+
+---
+
 ## Quick Start
 
 ### 1. Requirements
@@ -80,21 +95,6 @@ When you select a speaker dataset in the **Training** tab, the system runs deep 
 
 > [!NOTE]
 > Training workers are set to `0` on macOS to prevent pickling errors in PyTorch multiprocessing, and mixed precision is disabled for feature extraction stability (preventing NaN/pitch detection failures on Apple Silicon).
-
----
-
-## Screenshots
-
-<table width="100%">
-  <tr>
-    <td width="50%" align="center"><b>Dashboard</b><br/><img src="assets/dashboard.png" width="100%"/></td>
-    <td width="50%" align="center"><b>Dataset Manager</b><br/><img src="assets/dataset.png" width="100%"/></td>
-  </tr>
-  <tr>
-    <td width="50%" align="center"><b>Training Configuration</b><br/><img src="assets/training.png" width="100%"/></td>
-    <td width="50%" align="center"><b>Trained Models</b><br/><img src="assets/models.png" width="100%"/></td>
-  </tr>
-</table>
 
 ---
 
