@@ -13,7 +13,7 @@ A premium, hardware-aware desktop Web interface for training custom voice conver
 
 ---
 
-## Key Features
+## 🚀 Key Features
 
 * 🍎 **Apple Silicon (MPS) Acceleration** — Leverage your Mac's integrated GPU via PyTorch Metal Performance Shaders (MPS) with fallbacks for high-performance CPU training.
 * ⚙️ **Automatic Hardware Auto-Tuning** — Scans your system (unified memory budget, CPU counts, core profiles) and computes optimal training parameters (batch size, gradient accumulation steps, worker count).
@@ -24,7 +24,7 @@ A premium, hardware-aware desktop Web interface for training custom voice conver
 
 ---
 
-## Screenshots
+## 📸 Screenshots
 
 <table width="100%">
   <tr>
@@ -39,15 +39,15 @@ A premium, hardware-aware desktop Web interface for training custom voice conver
 
 ---
 
-## Quick Start
+## ⚡ Quick Start
 
-### 1. Requirements
+### 📋 Requirements
 
 * **OS**: macOS Monterey (12.3) or newer.
 * **Architecture**: Apple Silicon (M1/M2/M3/M4 Series recommended) or Intel.
 * **Interpreter**: Python 3.10 or newer.
 
-### 2. Launch the Web App
+### 💻 Launch the Web App
 
 Simply open your terminal, navigate to the project directory, and execute the startup script:
 
@@ -65,7 +65,7 @@ chmod +x start.sh
 
 ---
 
-## Directory Structure
+## 📂 Directory Structure
 
 ```text
 ├── assets/                  # UI assets and logos
@@ -82,7 +82,7 @@ chmod +x start.sh
 
 ---
 
-## Mac Hardware Auto-Tuning Profiles
+## 🍎 Mac Hardware Auto-Tuning Profiles
 
 When you select a speaker dataset in the **Training** tab, the system runs deep profiling of your unified memory to prevent out-of-memory crashes:
 
@@ -98,6 +98,6 @@ When you select a speaker dataset in the **Training** tab, the system runs deep 
 
 ---
 
-## Contributing & License
+## 📄 Contributing & License
 
 Feel free to open issues or pull requests. Project Beatrice V2 Voice Trainer is licensed under the [MIT License](LICENSE).
