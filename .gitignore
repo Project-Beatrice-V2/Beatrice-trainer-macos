@@ -10,7 +10,13 @@ env/
 .env
 
 # Large datasets & downloaded dependencies
-beatrice-trainer/
+beatrice-trainer/data/
+beatrice-trainer/output/
+beatrice-trainer/data_active/
+beatrice-trainer/.cache/
+beatrice-trainer/__pycache__/
+beatrice-trainer/*.log
+beatrice-trainer/test_training_status.json
 temp_clone/
 beatrice_dataset.zip
 
