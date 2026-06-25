@@ -1,0 +1,24 @@
+# Caches and Python compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment
+venv/
+ENV/
+env/
+.env
+
+# Large datasets & downloaded dependencies
+beatrice-trainer/
+temp_clone/
+beatrice_dataset.zip
+
+# Logs
+*.log
+trainer_stdout.log
+training.log
+
+# System files
+.DS_Store
+Thumbs.db

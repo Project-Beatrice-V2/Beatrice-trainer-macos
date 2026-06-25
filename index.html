@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Beatrice V2 Voice Conversion Trainer — Train custom voice models on Mac with local and Google Colab backends.">
+  <title>Beatrice V2 Trainer — Voice Conversion</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="index.css">
+</head>
+<body>
+
+  <!-- Toast notifications -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <!-- App Container -->
+  <div class="app-container">
+
+    <!-- Sidebar -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-brand">
+        <div class="brand-icon">🎙️</div>
+        <div class="brand-text">
+          <h2>Beatrice V2</h2>
+          <span>Voice Trainer</span>
+        </div>
+      </div>
+
+      <nav>
+        <div class="nav-section">
+          <div class="nav-label">Main</div>
+          <div class="nav-item active" data-page="dashboard" id="nav-dashboard">
+            <span class="nav-icon">📊</span>
+            <span>Dashboard</span>
+          </div>
+          <div class="nav-item" data-page="dataset" id="nav-dataset">
+            <span class="nav-icon">📁</span>
+            <span>Dataset</span>
+          </div>
+          <div class="nav-item" data-page="training" id="nav-training">
+            <span class="nav-icon">⚡</span>
+            <span>Training</span>
+          </div>
+          <div class="nav-item" data-page="models" id="nav-models">
+            <span class="nav-icon">🧠</span>
+            <span>Models</span>
+          </div>
+        </div>
+
+        <div class="nav-section">
+          <div class="nav-label">Tools</div>
+          <div class="nav-item" data-page="colab" id="nav-colab">
+            <span class="nav-icon">☁️</span>
+            <span>Colab Setup</span>
+          </div>
+          <div class="nav-item" data-page="settings" id="nav-settings">
+            <span class="nav-icon">⚙️</span>
+            <span>Settings</span>
+          </div>
+        </div>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="system-status">
+          <div class="status-dot" id="server-status-dot"></div>
+          <span id="server-status-text">Connecting...</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="main-content">
+
+      <!-- Mobile Header -->
+      <header class="mobile-header">
+        <button class="menu-toggle-btn" id="menu-toggle-btn" aria-label="Toggle Menu">
+          <span></span>
+          <span></span>
+          <span></span>
+        </button>
+        <div class="mobile-brand">
+          <span class="mobile-brand-icon">🎙️</span>
+          <span class="mobile-brand-text">Beatrice V2</span>
+        </div>
+      </header>
+
+      <!-- ===== DASHBOARD ===== -->
+      <section class="page-view active" id="page-dashboard">
+        <div class="page-header">
+          <h1>Welcome to <span class="text-gradient">Beatrice V2 Trainer</span></h1>
+          <p>Train custom voice conversion models on your Mac or Google Colab.</p>
+        </div>
+
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-label">Device</div>
+            <div class="stat-value" id="stat-device">Mac</div>
+            <div class="stat-sub" id="stat-device-sub">Detecting...</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Speakers</div>
+            <div class="stat-value" id="stat-speakers">0</div>
+            <div class="stat-sub">datasets loaded</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Audio Files</div>
+            <div class="stat-value" id="stat-files">0</div>
+            <div class="stat-sub">WAV files total</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Models</div>
+            <div class="stat-value" id="stat-models">0</div>
+            <div class="stat-sub">trained models</div>
+          </div>
+        </div>
+
+        <!-- Quick Actions -->
+        <div class="card">
+          <div class="card-header">
+            <h3>🚀 Quick Actions</h3>
+          </div>
+          <div class="card-body" style="display: flex; gap: var(--space-md); flex-wrap: wrap;">
+            <button class="btn btn-primary btn-lg" onclick="navigateTo('dataset')">
+              📁 Upload Dataset
+            </button>
+            <button class="btn btn-secondary btn-lg" onclick="navigateTo('training')">
+              ⚡ Start Training
+            </button>
+            <button class="btn btn-secondary btn-lg" onclick="navigateTo('colab')">
+              ☁️ Colab Guide
+            </button>
+          </div>
+        </div>
+
+        <!-- System Info & Memory Monitor -->
+        <div class="grid-2 mt-lg">
+          <!-- System Info -->
+          <div class="card">
+            <div class="card-header">
+              <h3>💻 System Information</h3>
+              <button class="btn btn-sm btn-secondary" onclick="refreshSystemInfo()">Refresh</button>
+            </div>
+            <div class="card-body">
+              <div class="grid-2">
+                <div>
+                  <div class="form-label">Platform</div>
+                  <div id="sys-platform" class="font-mono">Detecting...</div>
+                </div>
+                <div>
+                  <div class="form-label">Compute Backend</div>
+                  <div id="sys-compute" class="font-mono">Detecting...</div>
+                </div>
+                <div>
+                  <div class="form-label">Beatrice Trainer</div>
+                  <div id="sys-beatrice" class="font-mono">Checking...</div>
+                </div>
+                <div>
+                  <div class="form-label">Server Status</div>
+                  <div id="sys-server" class="font-mono">Checking...</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Memory Monitor -->
+          <div class="card">
+            <div class="card-header">
+              <h3>📊 Memory & GPU Monitor</h3>
+              <span class="badge badge-info" id="mem-status-badge">Active</span>
+            </div>
+            <div class="card-body">
+              <div class="form-group mb-md">
+                <div class="flex-between mb-xs">
+                  <span class="form-label mb-0">System RAM (Unified)</span>
+                  <span class="text-small font-mono" id="ram-usage-text">0.0 GB / 0.0 GB (0%)</span>
+                </div>
+                <div class="progress-bar-track">
+                  <div class="progress-bar-fill" id="ram-progress-bar" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="form-group mb-0" id="mps-mem-container" style="display: none;">
+                <div class="flex-between mb-xs">
+                  <span class="form-label mb-0">Apple MPS GPU Allocation</span>
+                  <span class="text-small font-mono" id="mps-usage-text">0.0 GB Allocated</span>
+                </div>
+                <div class="text-muted text-small" id="mps-driver-text">Driver: 0.0 GB</div>
+              </div>
+              <div class="empty-state py-sm" id="mps-mem-empty" style="display: block;">
+                <p class="text-muted text-small">Select MPS backend or start training to view GPU allocation.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== DATASET ===== -->
+      <section class="page-view" id="page-dataset">
+        <div class="page-header">
+          <h1>📁 <span class="text-gradient">Dataset Manager</span></h1>
+          <p>Upload WAV audio files to create speaker datasets for training.</p>
+        </div>
+
+        <!-- Speaker name -->
+        <div class="card mb-lg">
+          <div class="card-body">
+            <div class="form-group" style="margin-bottom: 0;">
+              <label class="form-label" for="speaker-name">Speaker Name</label>
+              <input type="text" class="form-input" id="speaker-name" placeholder="e.g. my_voice" value="">
+              <div class="form-hint">This will be the folder name for your audio files.</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Hugging Face Import -->
+        <div class="card mb-lg">
+          <div class="card-header">
+            <h3>📥 Import from Hugging Face</h3>
+            <span class="badge badge-info" id="hf-speaker-badge">Speaker: unnamed</span>
+          </div>
+          <div class="card-body">
+            <div class="form-group mb-0">
+              <label class="form-label" for="hf-repo-id">Dataset Repository ID or URL</label>
+              <div style="display: flex; gap: var(--space-md); align-items: center; width: 100%;">
+                <input type="text" class="form-input" id="hf-repo-id" placeholder="e.g. meoconxinhxan/trump-speech-dataset-tts" value="" style="flex: 1; margin-bottom: 0;">
+                <button class="btn btn-primary" id="btn-import-hf" onclick="importFromHF()" style="height: 42px;">
+                  ⚡ Import Dataset
+                </button>
+              </div>
+              <div class="form-hint" style="margin-top: var(--space-xs);">Pasting the full Hugging Face URL is also supported.</div>
+            </div>
+
+            <!-- Progress bar -->
+            <div id="hf-import-progress-container" style="display: none; margin-top: var(--space-md);">
+              <div class="flex-between mb-xs">
+                <span class="text-small text-muted" id="hf-import-status">Initializing...</span>
+                <span class="text-small font-mono" id="hf-import-progress-pct">0%</span>
+              </div>
+              <div class="progress-bar-track">
+                <div class="progress-bar-fill" id="hf-import-progress-bar" style="width: 0%"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Kaggle Import -->
+        <div class="card mb-lg">
+          <div class="card-header">
+            <h3>📋 Import from Kaggle</h3>
+            <span class="badge badge-info" id="kaggle-speaker-badge">Speaker: unnamed</span>
+          </div>
+          <div class="card-body">
+            <div class="grid-2 mb-md">
+              <div class="form-group" style="margin-bottom: 0;">
+                <label class="form-label" for="kaggle-username">Kaggle Username</label>
+                <input type="text" class="form-input" id="kaggle-username" placeholder="e.g. jatinpandey" value="" style="margin-bottom: 0;">
+              </div>
+              <div class="form-group" style="margin-bottom: 0;">
+                <label class="form-label" for="kaggle-key">Kaggle API Key (Token)</label>
+                <input type="password" class="form-input" id="kaggle-key" placeholder="e.g. 12ab34cd56ef..." value="" style="margin-bottom: 0;">
+              </div>
+            </div>
+
+            <div class="form-group mb-0">
+              <label class="form-label" for="kaggle-dataset-ref">Dataset Repository ID or URL</label>
+              <div style="display: flex; gap: var(--space-md); align-items: center; width: 100%;">
+                <input type="text" class="form-input" id="kaggle-dataset-ref" placeholder="e.g. dmitrybabko/speech-dataset-ch1" value="" style="flex: 1; margin-bottom: 0;">
+                <button class="btn btn-primary" id="btn-import-kaggle" onclick="importFromKaggle()" style="height: 42px;">
+                  ⚡ Import Dataset
+                </button>
+              </div>
+              <div class="form-hint" style="margin-top: var(--space-xs);">Pasting the full Kaggle URL is also supported.</div>
+            </div>
+
+            <!-- Progress bar -->
+            <div id="kaggle-import-progress-container" style="display: none; margin-top: var(--space-md);">
+              <div class="flex-between mb-xs">
+                <span class="text-small text-muted" id="kaggle-import-status">Initializing...</span>
+                <span class="text-small font-mono" id="kaggle-import-progress-pct">0%</span>
+              </div>
+              <div class="progress-bar-track">
+                <div class="progress-bar-fill" id="kaggle-import-progress-bar" style="width: 0%"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Drop Zone -->
+        <div class="card mb-lg">
+          <div class="card-header">
+            <h3>🎤 Upload Audio Files</h3>
+            <span class="badge badge-info" id="upload-speaker-badge">Speaker: unnamed</span>
+          </div>
+          <div class="card-body">
+            <div class="drop-zone" id="drop-zone">
+              <div class="drop-zone-icon">📦</div>
+              <div class="drop-zone-text">Drag & drop WAV or ZIP files here</div>
+              <div class="drop-zone-hint">or click to browse • WAV or ZIP format • 16kHz recommended</div>
+              <input type="file" id="file-input" accept=".wav,.zip" multiple hidden>
+            </div>
+          </div>
+        </div>
+
+        <!-- File List -->
+        <div class="card">
+          <div class="card-header">
+            <h3>📋 Uploaded Files</h3>
+            <div style="display: flex; gap: var(--space-sm); align-items: center;">
+              <span class="text-muted text-small" id="file-count-label">0 files</span>
+              <button class="btn btn-sm btn-secondary" onclick="refreshDataset()">Refresh</button>
+            </div>
+          </div>
+          <div class="card-body">
+            <div id="dataset-speakers-list">
+              <div class="empty-state">
+                <div class="empty-state-icon">📂</div>
+                <h3>No datasets yet</h3>
+                <p class="text-muted">Upload WAV files above to get started.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== TRAINING ===== -->
+      <section class="page-view" id="page-training">
+        <div class="page-header">
+          <h1>⚡ <span class="text-gradient">Training</span></h1>
+          <p>Configure and monitor your voice conversion model training.</p>
+        </div>
+
+        <!-- Training Config -->
+        <div class="card mb-lg">
+          <div class="card-header">
+            <h3>🔧 Configuration</h3>
+            <button class="btn btn-sm btn-secondary" onclick="autoConfigureParams()">Auto-Tuning</button>
+          </div>
+          <div class="card-body">
+            <div class="grid-2">
+              <!-- Left Column: Core Setup -->
+              <div>
+                <div class="form-group">
+                  <label class="form-label" for="train-speaker">Speaker</label>
+                  <select class="form-select" id="train-speaker" onchange="autoConfigureParams()">
+                    <option value="">— Select Speaker —</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <div class="flex-between">
+                    <label class="form-label" for="train-steps">Training Steps</label>
+                    <span class="text-small text-muted" id="steps-recommended-badge">Auto: —</span>
+                  </div>
+                  <input type="number" class="form-input" id="train-steps" value="10000" min="100" max="100000" step="100">
+                  <div class="form-hint">Recommended steps based on audio file count.</div>
+                </div>
+                <div class="form-group">
+                  <label class="form-label" for="train-lr">Learning Rate</label>
+                  <input type="text" class="form-input" id="train-lr" value="1e-4">
+                  <div class="form-hint">Default: 1e-4</div>
+                </div>
+
+                <!-- Advanced Settings Toggle -->
+                <div style="margin-top: var(--space-md); margin-bottom: var(--space-md);">
+                  <button type="button" class="btn btn-sm btn-secondary" onclick="toggleAdvancedSettings()" id="btn-toggle-advanced">
+                    ⚙️ Show Advanced Mac Settings
+                  </button>
+                </div>
+
+                <!-- Advanced Settings Block -->
+                <div id="advanced-settings-block" style="display: none; border-top: 1px solid var(--border-subtle); padding-top: var(--space-md); margin-top: var(--space-md);">
+                  <div class="grid-2">
+                    <div class="form-group">
+                      <label class="form-label" for="train-batch">Batch Size</label>
+                      <input type="number" class="form-input" id="train-batch" value="4" min="1" max="32">
+                    </div>
+                    <div class="form-group">
+                      <label class="form-label" for="train-grad-accum">Gradient Accumulation</label>
+                      <input type="number" class="form-input" id="train-grad-accum" value="1" min="1" max="32">
+                    </div>
+                  </div>
+                  <div class="grid-2">
+                    <div class="form-group">
+                      <label class="form-label" for="train-workers">Data Workers</label>
+                      <input type="number" class="form-input" id="train-workers" value="0" min="0" max="16">
+                    </div>
+                    <div class="form-group" style="display: flex; flex-direction: column; justify-content: center;">
+                      <label class="form-label" style="display: flex; align-items: center; gap: var(--space-sm); cursor: pointer; user-select: none;">
+                        <input type="checkbox" id="train-mixed-precision" style="width: 16px; height: 16px; accent-color: var(--accent-primary);">
+                        Mixed Precision (FP16)
+                      </label>
+                    </div>
+                  </div>
+                  <div class="grid-2">
+                    <div class="form-group" style="display: flex; flex-direction: column; justify-content: center; margin-bottom: 0;">
+                      <label class="form-label" style="display: flex; align-items: center; gap: var(--space-sm); cursor: pointer; user-select: none; margin-bottom: 0;">
+                        <input type="checkbox" id="train-compile" style="width: 16px; height: 16px; accent-color: var(--accent-primary);">
+                        Compile Model (torch.compile)
+                      </label>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Right Column: Auto-Configuration Info & Status -->
+              <div style="border-left: 1px solid var(--border-subtle); padding-left: var(--space-lg); display: flex; flex-direction: column;">
+                <h4 style="margin-bottom: var(--space-md); display: flex; align-items: center; gap: var(--space-sm);">
+                  🍎 Apple Silicon Hardware Tuning
+                </h4>
+                
+                <div class="empty-state py-md" id="config-empty-state" style="margin: auto 0;">
+                  <p class="text-muted text-small">Select a speaker to compute optimized hyperparameters for this Mac.</p>
+                </div>
+
+                <div id="config-tuning-details" style="display: none; flex: 1;">
+                  <div style="background: rgba(0, 0, 0, 0.2); padding: var(--space-md); border-radius: var(--radius-md); margin-bottom: var(--space-md); font-size: 0.8125rem;">
+                    <div class="flex-between mb-sm">
+                      <span class="text-muted">Target Device:</span>
+                      <strong class="font-mono" id="config-val-device">—</strong>
+                    </div>
+                    <div class="flex-between mb-sm">
+                      <span class="text-muted">Opt. Batch Size:</span>
+                      <strong class="font-mono" id="config-val-batch">—</strong>
+                    </div>
+                    <div class="flex-between mb-sm">
+                      <span class="text-muted">Opt. Grad Accum:</span>
+                      <strong class="font-mono" id="config-val-accum">—</strong>
+                    </div>
+                    <div class="flex-between mb-sm">
+                      <span class="text-muted">Effective Batch:</span>
+                      <strong class="font-mono" id="config-val-effective">—</strong>
+                    </div>
+                    <div class="flex-between">
+                      <span class="text-muted">Est. Training Time:</span>
+                      <strong class="font-mono text-accent" id="config-val-time">—</strong>
+                    </div>
+                  </div>
+
+                  <div style="display: flex; flex-direction: column; gap: var(--space-xs);" id="config-opt-notes">
+                    <!-- optimization notes list -->
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div style="display: flex; gap: var(--space-md); margin-top: var(--space-lg); border-top: 1px solid var(--border-subtle); padding-top: var(--space-lg);">
+              <button class="btn btn-primary btn-lg" id="btn-start-training" onclick="startTraining()">
+                ▶️ Start Training
+              </button>
+              <button class="btn btn-danger btn-lg" id="btn-stop-training" onclick="stopTraining()" style="display: none;">
+                ⏹️ Stop Training
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Training Progress -->
+        <div class="card mb-lg" id="training-progress-card" style="display: none;">
+          <div class="card-header">
+            <h3>📈 Training Progress</h3>
+            <span class="badge badge-success" id="training-status-badge">Running</span>
+          </div>
+          <div class="card-body">
+            <div class="stats-grid" style="margin-bottom: var(--space-lg);">
+              <div class="stat-card">
+                <div class="stat-label">Current Step</div>
+                <div class="stat-value font-mono" id="train-current-step">0</div>
+                <div class="stat-sub" id="train-total-steps-label">/ 10,000</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-label">Loss</div>
+                <div class="stat-value font-mono" id="train-loss">—</div>
+                <div class="stat-sub">current loss value</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-label">ETA</div>
+                <div class="stat-value font-mono" id="train-eta">—</div>
+                <div class="stat-sub">estimated remaining</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-label">Speed</div>
+                <div class="stat-value font-mono" id="train-speed">—</div>
+                <div class="stat-sub">steps per second</div>
+              </div>
+              <div class="stat-card" id="train-process-mem-card">
+                <div class="stat-label">Process Memory</div>
+                <div class="stat-value font-mono" id="train-process-mem">—</div>
+                <div class="stat-sub">active process RAM</div>
+              </div>
+            </div>
+
+            <!-- Progress bar -->
+            <div style="margin-bottom: var(--space-lg);">
+              <div class="flex-between mb-md">
+                <span class="text-small text-muted">Progress</span>
+                <span class="text-small font-mono" id="train-progress-pct">0%</span>
+              </div>
+              <div class="progress-bar-track">
+                <div class="progress-bar-fill" id="train-progress-bar" style="width: 0%"></div>
+              </div>
+            </div>
+
+            <!-- Loss chart -->
+            <div class="training-chart-container">
+              <canvas id="loss-chart"></canvas>
+            </div>
+          </div>
+        </div>
+
+        <!-- Training Log -->
+        <div class="card">
+          <div class="card-header">
+            <h3>📜 Training Log</h3>
+            <button class="btn btn-sm btn-secondary" onclick="clearLog()">Clear</button>
+          </div>
+          <div class="card-body">
+            <div class="log-console" id="training-log">
+              <div class="log-line log-info">[INFO] Ready to start training. Select a speaker and configure parameters above.</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== MODELS ===== -->
+      <section class="page-view" id="page-models">
+        <div class="page-header">
+          <h1>🧠 <span class="text-gradient">Trained Models</span></h1>
+          <p>Browse and download your trained voice conversion models.</p>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h3>📦 Available Models</h3>
+            <button class="btn btn-sm btn-secondary" onclick="refreshModels()">Refresh</button>
+          </div>
+          <div class="card-body" id="models-list">
+            <div class="empty-state">
+              <div class="empty-state-icon">🧠</div>
+              <h3>No models yet</h3>
+              <p class="text-muted">Train your first model to see it here.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== COLAB ===== -->
+      <section class="page-view" id="page-colab">
+        <div class="page-header">
+          <h1>☁️ <span class="text-gradient">Google Colab Setup</span></h1>
+          <p>Use Google Colab's free GPU for faster training.</p>
+        </div>
+
+        <div class="card mb-lg">
+          <div class="card-header">
+            <h3>📋 How to Use Colab</h3>
+          </div>
+          <div class="card-body">
+            <div style="line-height: 2;">
+              <p><strong>Step 1:</strong> Open the modified <code>BeatriceV2_Trainer_Notebook.ipynb</code> in Google Colab.</p>
+              <p><strong>Step 2:</strong> Run the "Install Modules" cell to set up the environment.</p>
+              <p><strong>Step 3:</strong> In the "Upload Your Dataset" cell, upload a ZIP of your WAV files.</p>
+              <p><strong>Step 4:</strong> Set your speaker name and run the cell.</p>
+              <p><strong>Step 5:</strong> Run the "Settings" cell to start the training UI.</p>
+              <p><strong>Step 6:</strong> Download the trained model from the <code>output/</code> folder.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="card mb-lg">
+          <div class="card-header">
+            <h3>⚠️ Important Notes</h3>
+          </div>
+          <div class="card-body">
+            <div style="line-height: 2; color: var(--text-secondary);">
+              <p>• The Colab notebook has been modified to <strong>remove</strong> the default HuggingFace dataset.</p>
+              <p>• You must <strong>upload your own WAV dataset</strong> as a ZIP file.</p>
+              <p>• Audio should ideally be <strong>16kHz mono WAV</strong> format for best results.</p>
+              <p>• Colab's free T4 GPU is <strong>significantly faster</strong> than Mac CPU/MPS training.</p>
+              <p>• Training typically takes <strong>30–90 minutes</strong> on a T4 GPU for 10K steps.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h3>📂 Prepare Your Dataset</h3>
+          </div>
+          <div class="card-body">
+            <p class="text-muted mb-md">You can prepare your dataset locally and export it as a ZIP for Colab.</p>
+            <button class="btn btn-primary" id="btn-export-zip" onclick="exportDatasetZip()">
+              📦 Export Dataset as ZIP
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== SETTINGS ===== -->
+      <section class="page-view" id="page-settings">
+        <div class="page-header">
+          <h1>⚙️ <span class="text-gradient">Settings</span></h1>
+          <p>Configure the Beatrice Trainer backend and preferences.</p>
+        </div>
+
+        <div class="card mb-lg">
+          <div class="card-header">
+            <h3>🔌 Backend Connection</h3>
+          </div>
+          <div class="card-body">
+            <div class="form-group">
+              <label class="form-label" for="api-url">API Server URL</label>
+              <input type="text" class="form-input" id="api-url" value="http://localhost:8000">
+              <div class="form-hint">The URL of the local Python backend server.</div>
+            </div>
+            <button class="btn btn-secondary" onclick="testConnection()">Test Connection</button>
+          </div>
+        </div>
+
+        <div class="card mb-lg">
+          <div class="card-header">
+            <h3>📁 Beatrice Trainer</h3>
+          </div>
+          <div class="card-body">
+            <div class="form-group">
+              <label class="form-label">Trainer Directory</label>
+              <div class="font-mono" id="settings-trainer-dir">Not configured</div>
+            </div>
+            <button class="btn btn-primary" onclick="setupBeatriceTrainer()">
+              📥 Clone / Update Beatrice Trainer
+            </button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h3>🗑️ Danger Zone</h3>
+          </div>
+          <div class="card-body">
+            <p class="text-muted mb-md">Clear all local data, datasets, and trained models.</p>
+            <button class="btn btn-danger" onclick="clearAllData()">Reset Everything</button>
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
