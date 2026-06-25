@@ -414,6 +414,12 @@ async function refreshDataset() {
     renderSpeakersList();
     document.getElementById('file-count-label').textContent =
       `${state.speakers.reduce((s, sp) => s + (sp.file_count || 0), 0)} files across ${state.speakers.length} speakers`;
+    
+    // Update dashboard stats in DOM if present
+    const statSpeakers = document.getElementById('stat-speakers');
+    const statFiles = document.getElementById('stat-files');
+    if (statSpeakers) statSpeakers.textContent = state.speakers.length;
+    if (statFiles) statFiles.textContent = state.speakers.reduce((sum, s) => sum + (s.file_count || 0), 0);
   } catch {
     // Render empty
     renderSpeakersList();
@@ -864,6 +870,10 @@ async function refreshModels() {
     const data = await api('/api/models/list');
     state.models = data.models || [];
     renderModelsList();
+    
+    // Update dashboard stats in DOM if present
+    const statModels = document.getElementById('stat-models');
+    if (statModels) statModels.textContent = state.models.length;
   } catch {
     renderModelsList();
   }
