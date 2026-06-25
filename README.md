@@ -4,10 +4,10 @@
 
 # Beatrice V2 Voice Trainer (macOS Edition)
 
-[![Platform: macOS](https://img.shields.shields.rules.work/badge/Platform-macOS%2012.3%2B-blue?logo=apple&logoColor=white&style=flat-square)](#)
-[![Python: 3.10+](https://img.shields.shields.rules.work/badge/Python-3.10%2B-blue.svg?logo=python&logoColor=white&style=flat-square)](#)
-[![PyTorch: 2.0+](https://img.shields.shields.rules.work/badge/PyTorch-2.0%2B-orange?logo=pytorch&logoColor=white&style=flat-square)](#)
-[![License: MIT](https://img.shields.shields.rules.work/badge/License-MIT-green.svg?style=flat-square)](#)
+[![Platform: macOS](https://img.shields.io/badge/Platform-macOS%2012.3%2B-blue?logo=apple&logoColor=white&style=flat-square)](#)
+[![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white&style=flat-square)](#)
+[![PyTorch: 2.0+](https://img.shields.io/badge/PyTorch-2.0%2B-orange?logo=pytorch&logoColor=white&style=flat-square)](#)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green?style=flat-square)](#)
 
 A premium, hardware-aware desktop Web interface for training custom voice conversion models using **Beatrice V2** on macOS. This frontend-backend application features automatic hardware profiling for Apple Silicon and Intel Macs, unified memory management, robust dataset importing, real-time training analytics, and a cloud fallback bridge for training on Google Colab.
 
