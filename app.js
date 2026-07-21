@@ -111,12 +111,14 @@ async function checkServerStatus() {
 function updateSystemInfo(data) {
   if (!data) return;
   const el = (id) => document.getElementById(id);
-  el('stat-device').textContent = data.device || 'Mac';
+  el('stat-device').textContent = data.device || 'System';
   el('stat-device-sub').textContent = data.compute || 'CPU';
-  el('sys-platform').textContent = data.platform || 'macOS';
+  el('sys-platform').textContent = data.platform || 'System';
   el('sys-compute').textContent = data.compute || 'CPU';
-  el('sys-beatrice').textContent = data.beatrice_installed ? '✅ Installed' : '❌ Not found';
-  el('sys-server').textContent = '✅ Connected';
+  el('sys-beatrice').innerHTML = data.beatrice_installed 
+    ? '<span class="badge badge-success" style="display:inline-flex; align-items:center; gap:4px;"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> Installed</span>' 
+    : '<span class="badge badge-danger" style="display:inline-flex; align-items:center; gap:4px;"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg> Not found</span>';
+  el('sys-server').innerHTML = '<span class="badge badge-success" style="display:inline-flex; align-items:center; gap:4px;"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> Connected</span>';
 }
 
 async function refreshSystemInfo() {
@@ -179,11 +181,24 @@ function setupDropZone() {
   const speakerInput = document.getElementById('speaker-name');
   speakerInput.addEventListener('input', () => {
     const val = speakerInput.value || 'unnamed';
-    document.getElementById('upload-speaker-badge').textContent = `Speaker: ${val}`;
+    const activeBadge = document.getElementById('active-speaker-badge');
+    if (activeBadge) activeBadge.textContent = `Speaker: ${val}`;
+    const uploadBadge = document.getElementById('upload-speaker-badge');
+    if (uploadBadge) uploadBadge.textContent = `Speaker: ${val}`;
     const hfBadge = document.getElementById('hf-speaker-badge');
     if (hfBadge) hfBadge.textContent = `Speaker: ${val}`;
     const kaggleBadge = document.getElementById('kaggle-speaker-badge');
     if (kaggleBadge) kaggleBadge.textContent = `Speaker: ${val}`;
+  });
+}
+
+function switchImportMethod(method) {
+  const methods = ['local', 'hf', 'kaggle'];
+  methods.forEach(m => {
+    const tab = document.getElementById(`tab-method-${m}`);
+    const container = document.getElementById(`import-container-${m}`);
+    if (tab) tab.classList.toggle('active', m === method);
+    if (container) container.style.display = (m === method) ? 'block' : 'none';
   });
 }
 
@@ -431,21 +446,27 @@ function renderSpeakersList() {
   if (!state.speakers.length) {
     container.innerHTML = `
       <div class="empty-state">
-        <div class="empty-state-icon">📂</div>
-        <h3>No datasets yet</h3>
-        <p class="text-muted">Upload WAV files above to get started.</p>
+        <div class="empty-state-icon">
+          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+        </div>
+        <h3>No datasets uploaded yet</h3>
+        <p class="text-muted">Upload WAV files above to create your speaker dataset.</p>
       </div>`;
     return;
   }
 
   container.innerHTML = state.speakers.map(sp => `
-    <div class="model-card">
-      <div class="model-icon">🎤</div>
-      <div class="model-info">
-        <div class="model-name">${escapeHtml(sp.name)}</div>
-        <div class="model-meta">${sp.file_count || 0} WAV files${sp.duration ? ` • ${formatDuration(sp.duration)}` : ''}</div>
+    <div class="model-card" style="display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; background: var(--bg-card); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); margin-bottom: 8px;">
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div style="width: 36px; height: 36px; border-radius: var(--radius-sm); background: var(--accent-subtle); color: var(--accent-text); display: flex; align-items: center; justify-content: center;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+        </div>
+        <div>
+          <div class="model-name" style="font-weight: 600; color: var(--text-primary); font-size: 14px;">${escapeHtml(sp.name)}</div>
+          <div class="model-meta" style="font-size: 12px; color: var(--text-muted);">${sp.file_count || 0} WAV files${sp.duration ? ` • ${formatDuration(sp.duration)}` : ''}</div>
+        </div>
       </div>
-      <button class="btn btn-sm btn-danger" onclick="deleteSpeaker('${escapeHtml(sp.name)}')">🗑️</button>
+      <button class="btn btn-sm btn-danger" onclick="deleteSpeaker('${escapeHtml(sp.name)}')">Delete</button>
     </div>
   `).join('');
 }
@@ -491,10 +512,10 @@ function toggleAdvancedSettings() {
   const btn = document.getElementById('btn-toggle-advanced');
   if (block.style.display === 'none') {
     block.style.display = 'block';
-    btn.textContent = '⚙️ Hide Advanced Mac Settings';
+    btn.textContent = '⚙️ Hide Advanced Hardware Settings';
   } else {
     block.style.display = 'none';
-    btn.textContent = '⚙️ Show Advanced Mac Settings';
+    btn.textContent = '⚙️ Show Advanced Hardware Settings';
   }
 }
 
@@ -537,7 +558,7 @@ async function autoConfigureParams() {
     document.getElementById('config-val-effective').textContent = config.effective_batch_size;
 
     // Time estimate: based on steps and device speed
-    const stepsPerSecEst = config.device === 'mps' ? 3.5 : 1.2;
+    const stepsPerSecEst = config.device === 'cuda' ? 6.0 : (config.device === 'mps' ? 3.5 : 1.2);
     document.getElementById('config-val-time').textContent = formatDuration(config.max_steps / stepsPerSecEst);
 
     // Render notes
@@ -548,7 +569,7 @@ async function autoConfigureParams() {
       </div>
     `).join('');
 
-    showToast('Applied Mac-optimized hardware tuning parameters.', 'success');
+    showToast('Applied hardware auto-tuning parameters.', 'success');
   } catch (err) {
     showToast(`Tuning failed: ${err.message}`, 'error');
   }
@@ -884,9 +905,11 @@ function renderModelsList() {
   if (!state.models.length) {
     container.innerHTML = `
       <div class="empty-state">
-        <div class="empty-state-icon">🧠</div>
-        <h3>No models yet</h3>
-        <p class="text-muted">Train your first model to see it here.</p>
+        <div class="empty-state-icon">
+          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/></svg>
+        </div>
+        <h3>No trained models yet</h3>
+        <p class="text-muted">Start training a voice model to generate output weights here.</p>
       </div>`;
     return;
   }
@@ -895,27 +918,29 @@ function renderModelsList() {
     const isParaphernalia = m.name.startsWith('paraphernalia_');
     const displayName = isParaphernalia ? m.name.replace('paraphernalia_', '') : m.name;
     const typeLabel = isParaphernalia 
-      ? '<span class="badge badge-success" style="margin-left: var(--space-xs);">Inference Package</span>' 
-      : '<span class="badge badge-info" style="margin-left: var(--space-xs);">Checkpoint</span>';
-    const icon = isParaphernalia ? '📦' : '🧠';
+      ? '<span class="badge badge-success">Inference Package</span>' 
+      : '<span class="badge badge-info">Checkpoint</span>';
 
     return `
-      <div class="model-card">
-        <div class="model-icon" style="background: ${isParaphernalia ? 'var(--gradient-cool)' : 'var(--gradient-warm)'};">${icon}</div>
-        <div class="model-info">
-          <div class="model-name" style="display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-xs);">
-            ${escapeHtml(displayName)}
-            ${typeLabel}
+      <div class="model-card" style="display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; background: var(--bg-card); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); margin-bottom: 8px;">
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <div style="width: 36px; height: 36px; border-radius: var(--radius-sm); background: var(--accent-subtle); color: var(--accent-text); display: flex; align-items: center; justify-content: center;">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/></svg>
           </div>
-          <div class="model-meta">
-            ${m.size ? formatBytes(m.size) : 'Unknown size'}
-            ${m.created ? ` • ${new Date(m.created).toLocaleString()}` : ''}
-            ${isParaphernalia ? ' • Zipped on download (contains 7 files)' : ''}
+          <div>
+            <div class="model-name" style="font-weight: 600; color: var(--text-primary); font-size: 14px; display: flex; align-items: center; gap: 8px;">
+              ${escapeHtml(displayName)}
+              ${typeLabel}
+            </div>
+            <div class="model-meta" style="font-size: 12px; color: var(--text-muted);">
+              ${m.size ? formatBytes(m.size) : 'Unknown size'}
+              ${m.created ? ` • ${new Date(m.created).toLocaleString()}` : ''}
+            </div>
           </div>
         </div>
-        <div style="display: flex; gap: var(--space-xs);">
-          <a href="${CONFIG.apiUrl}/api/models/download/${encodeURIComponent(m.path)}" class="btn btn-sm btn-success" download>📥 Download</a>
-          <button class="btn btn-sm btn-danger" onclick="deleteModel(decodeURIComponent('${encodeURIComponent(m.path)}'))">🗑️ Delete</button>
+        <div style="display: flex; gap: 8px;">
+          <a href="${CONFIG.apiUrl}/api/models/download/${encodeURIComponent(m.path)}" class="btn btn-sm btn-primary" download>Download</a>
+          <button class="btn btn-sm btn-danger" onclick="deleteModel(decodeURIComponent('${encodeURIComponent(m.path)}'))">Delete</button>
         </div>
       </div>
     `;
@@ -960,8 +985,14 @@ function showToast(message, type = 'info') {
   const toast = document.createElement('div');
   toast.className = 'toast';
 
-  const icons = { info: 'ℹ️', success: '✅', warning: '⚠️', error: '❌' };
-  toast.innerHTML = `<span>${icons[type] || 'ℹ️'}</span><span>${escapeHtml(message)}</span>`;
+  const icons = { 
+    info: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#00b4d8" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>', 
+    success: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>', 
+    warning: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2.5"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>', 
+    error: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>' 
+  };
+  const cleanMsg = message.replace(/^[✅❌⚠️ℹ️⚡]\s*/, '');
+  toast.innerHTML = `<span style="display:flex;align-items:center;">${icons[type] || icons.info}</span><span>${escapeHtml(cleanMsg)}</span>`;
 
   container.appendChild(toast);
 
@@ -977,8 +1008,8 @@ function testConnection() {
   CONFIG.apiUrl = url;
   localStorage.setItem('beatrice_api_url', url);
   checkServerStatus().then(data => {
-    if (data) showToast('✅ Connection successful!', 'success');
-    else showToast('❌ Cannot reach server', 'error');
+    if (data) showToast('Connection successful!', 'success');
+    else showToast('Cannot reach server', 'error');
   });
 }
 
@@ -1042,8 +1073,39 @@ function formatBytes(bytes) {
   return `${(bytes / 1048576).toFixed(1)} MB`;
 }
 
-// ---------- Initialization ----------
+// ---------- Theme (Light / Dark Mode) ----------
+function initTheme() {
+  const savedTheme = localStorage.getItem('beatrice_theme') || 'dark';
+  applyTheme(savedTheme);
+}
+
+function toggleTheme() {
+  const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
+  const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+  applyTheme(newTheme);
+  localStorage.setItem('beatrice_theme', newTheme);
+  showToast(`Switched to ${newTheme === 'dark' ? 'Dark Mode' : 'Light Mode'}`, 'info');
+}
+
+function applyTheme(theme) {
+  if (theme === 'light') {
+    document.documentElement.setAttribute('data-theme', 'light');
+    const toggleText = document.getElementById('theme-toggle-text');
+    if (toggleText) toggleText.textContent = 'Dark Mode';
+  } else {
+    document.documentElement.removeAttribute('data-theme');
+    const toggleText = document.getElementById('theme-toggle-text');
+    if (toggleText) toggleText.textContent = 'Light Mode';
+  }
+}
+
+// Immediately apply theme setting to avoid flash of wrong theme
+initTheme();
+
+// ---------- Init ----------
 document.addEventListener('DOMContentLoaded', () => {
+  setupDatasetEvents();
+  setupLossChart();
   setupDropZone();
   checkServerStatus().then(status => {
     if (status) {
