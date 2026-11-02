@@ -68,6 +68,41 @@ torch.amp.GradScaler = patched_GradScaler
 # =============================================
 
 
+# ===== WEB UI PROGRESS REPORTING (not upstream) =====
+# When BEATRICE_STATUS_LOG_FILE is set (by the web UI's webui_runner.py), the
+# training loop writes a small JSON status file the web server polls.
+def _write_webui_status(status_data: dict) -> None:
+    status_log_path = os.environ.get("BEATRICE_STATUS_LOG_FILE")
+    if not status_log_path:
+        return
+    status = {"active": True, "completed": False, "error": None}
+    status.update(status_data)
+    try:
+        import time as _time
+
+        status["updated_at"] = _time.time()
+        try:
+            import psutil
+
+            status["memory_mb"] = round(
+                psutil.Process().memory_info().rss / 1024 / 1024, 1
+            )
+        except Exception:
+            status.setdefault("memory_mb", None)
+        tmp_path = status_log_path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as sf:
+                json.dump(status, sf)
+            os.replace(tmp_path, status_log_path)
+        except OSError:
+            # os.replace may fail on Windows while the server is reading the file
+            with open(status_log_path, "w", encoding="utf-8") as sf:
+                json.dump(status, sf)
+    except Exception:
+        pass
+# =============================================
+
+
 # モジュールのバージョンではない
 PARAPHERNALIA_VERSION = "2.0.0-rc.0"
 
@@ -4137,6 +4172,21 @@ if __name__ == "__main__" and writer is not None:
         if h.profile
         else nullcontext()
     ) as profiler:
+        # Web UI progress reporting (not upstream): rolling window of step timestamps
+        import time as _webui_time
+        from collections import deque as _webui_deque
+
+        _webui_step_times = _webui_deque(maxlen=50)
+        _webui_last_loss = None
+        _write_webui_status(
+            {
+                "phase": "training",
+                "step": initial_iteration,
+                "total_steps": h.n_steps,
+                "loss": None,
+                "device": str(device),
+            }
+        )
         for iteration in tqdm(range(initial_iteration, h.n_steps), desc="Training"):
             # === 1. データ前処理 ===
             try:
@@ -4288,33 +4338,33 @@ if __name__ == "__main__" and writer is not None:
             for k, v in gradient_balancer_stats.items():
                 dict_scalars[f"~gradient_balancer/{k}"].append(v)
 
-            # Write progress to status log file if specified
-            status_log_path = os.environ.get("BEATRICE_STATUS_LOG_FILE")
-            if status_log_path:
-                try:
-                    import psutil
-                    memory_mb = round(psutil.Process().memory_info().rss / 1024 / 1024, 1)
-                except:
-                    memory_mb = None
-
+            # Web UI progress reporting (not upstream). "completed" stays False
+            # here: the final evaluation/save of the last step still follows.
+            if os.environ.get("BEATRICE_STATUS_LOG_FILE"):
                 combined_loss = loss_loudness + loss_mel + loss_fm + loss_adv
                 if h.grad_weight_ap:
                     combined_loss += loss_ap
-
-                status_data = {
-                    "active": True,
-                    "step": iteration + 1,
-                    "total_steps": h.n_steps,
-                    "loss": round(combined_loss, 6),
-                    "completed": (iteration + 1) >= h.n_steps,
-                    "memory_mb": memory_mb,
-                    "device": str(device)
-                }
-                try:
-                    with open(status_log_path, "w") as sf:
-                        json.dump(status_data, sf)
-                except Exception as e:
-                    pass
+                _webui_last_loss = round(float(combined_loss), 6)
+                _webui_step_times.append((_webui_time.time(), iteration + 1))
+                _webui_rate = None
+                _webui_eta = None
+                if len(_webui_step_times) >= 2:
+                    (_t0, _s0), (_t1, _s1) = _webui_step_times[0], _webui_step_times[-1]
+                    if _t1 > _t0 and _s1 > _s0:
+                        _webui_rate = (_s1 - _s0) / (_t1 - _t0)
+                        _webui_eta = round((h.n_steps - (iteration + 1)) / _webui_rate, 1)
+                        _webui_rate = round(_webui_rate, 3)
+                _write_webui_status(
+                    {
+                        "phase": "training",
+                        "step": iteration + 1,
+                        "total_steps": h.n_steps,
+                        "loss": _webui_last_loss,
+                        "steps_per_sec": _webui_rate,
+                        "eta_seconds": _webui_eta,
+                        "device": str(device),
+                    }
+                )
 
             if (iteration + 1) % 1000 == 0 or iteration == 0:
                 for name, scalars in dict_scalars.items():
@@ -4622,20 +4672,15 @@ description = """
 
     print("Training finished.")
 
-    # Write final completed status to log file if specified
-    status_log_path = os.environ.get("BEATRICE_STATUS_LOG_FILE")
-    if status_log_path:
-        try:
-            status_data = {
-                "active": False,
-                "step": h.n_steps,
-                "total_steps": h.n_steps,
-                "loss": round(combined_loss, 6) if 'combined_loss' in locals() else None,
-                "completed": True,
-                "memory_mb": None,
-                "device": str(device)
-            }
-            with open(status_log_path, "w") as sf:
-                json.dump(status_data, sf)
-        except:
-            pass
+    # Web UI progress reporting (not upstream): final status
+    _write_webui_status(
+        {
+            "active": False,
+            "completed": True,
+            "phase": "finished",
+            "step": h.n_steps,
+            "total_steps": h.n_steps,
+            "loss": _webui_last_loss,
+            "device": str(device),
+        }
+    )

@@ -1,130 +1,185 @@
-<p align="center">
-  <img src="assets/logo.jpg" alt="Project Beatrice V2 Logo" width="150" style="border-radius: 12px; box-shadow: 0 4px 20px rgba(0, 180, 216, 0.3);" />
-</p>
+<div align="center">
 
-# Project Beatrice V2 Voice Trainer (macOS Edition)
+<img src="docs/media/app-icon.png" alt="Beatrice app icon" width="128" />
 
-[![Platform: macOS](https://img.shields.io/badge/Platform-macOS%2012%2B%20(Apple%20Silicon%20%2F%20Intel)-apple?logo=apple&logoColor=white&style=flat-square)](#)
-[![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-00b4d8?logo=python&logoColor=white&style=flat-square)](#)
-[![PyTorch: MPS (Metal)](https://img.shields.io/badge/PyTorch-MPS%20(Metal)-orange?logo=pytorch&logoColor=white&style=flat-square)](#)
-[![HuggingFace: fierce-cats/beatrice-trainer](https://img.shields.io/badge/HuggingFace-fierce--cats%2Fbeatrice--trainer-yellow?logo=huggingface&logoColor=white&style=flat-square)](#)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green?style=flat-square)](#)
+# Beatrice Trainer for Mac
 
-A high-performance, hardware-aware desktop Web application for training custom real-time voice conversion models using **Project Beatrice V2** on macOS (Apple Silicon M1/M2/M3/M4 & Intel Macs). Featuring a modern **Cyan Blue minimalist UI**, dynamic **Light/Dark theme toggle**, **Single-Choice Dataset Import Selector** (Local Drop-Zone, Hugging Face, Kaggle), automated **Apple Silicon MPS Hardware Tuning**, and direct **Google Colab & Kaggle Cloud Launchpad** integration.
+**Train your own voice for the Beatrice voice changer, on your Mac.**<br/>
+Add recordings of one speaker, press Start, then import the finished model into Beatrice with **Upload Custom Model**.
 
----
+[![Download ZIP](https://img.shields.io/badge/Download-ZIP-000000?style=for-the-badge&logo=github&logoColor=white&labelColor=000000)](https://github.com/Project-Beatrice-V2/Beatrice-trainer-macos/archive/refs/heads/main.zip)
+[![Website](https://img.shields.io/badge/Website-project--beatrice.vercel.app-7c8cff?style=for-the-badge&labelColor=000000)](https://project-beatrice.vercel.app)
+[![Stars across all Beatrice repos](https://img.shields.io/endpoint?url=https%3A%2F%2Fproject-beatrice.vercel.app%2Fapi%2Fstars%3Fformat%3Dshields&style=for-the-badge)](https://github.com/Project-Beatrice-V2)
 
-## ✨ Key Features
+![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-recommended-a887dc?style=flat-square&labelColor=000000)
+![Python](https://img.shields.io/badge/Python-3.10%20→%203.13-a887dc?style=flat-square&labelColor=000000)
+![PyTorch MPS](https://img.shields.io/badge/PyTorch-MPS-a887dc?style=flat-square&labelColor=000000)
+![Runs locally](https://img.shields.io/badge/runs-locally-3dffa8?style=flat-square&labelColor=000000)
+![License](https://img.shields.io/badge/license-MIT-a1a1aa?style=flat-square&labelColor=000000)
 
-* 💎 **Cyan Blue Minimalist UI & Vector SVGs** — Ultra-sleek Linear/Vercel-inspired desktop design system with custom vector SVG icons and sharp typography (`Inter`, `Outfit`, `JetBrains Mono`).
-* 🌓 **Light & Dark Mode Theme Switcher** — Instant theme switching with persistent user preferences stored in local storage (`localStorage`).
-* 🎯 **Single-Choice Dataset Import Selector** — Segmented method picker allowing users to easily choose between **Local Audio Upload**, **Hugging Face Import**, or **Kaggle Dataset Import**.
-* 🍎 **Apple Silicon MPS Hardware Tuning** — Deep profiling for Apple M1, M2, M3, M4 (Base, Pro, Max, Ultra) using PyTorch Metal Performance Shaders (MPS) and unified memory allocation.
-* ☁️ **Cloud Training Launchpad** — Direct integration of `Project-Beatrice-V2/Beatrice-colab` with one-click **Google Colab** (`.ipynb`) and **Kaggle** launch buttons and local notebook downloads.
-* 📈 **Real-Time Monitoring & Metrics** — Live loss plotting on HTML Canvas, stdout logging console, and unified RAM/MPS memory usage gauges.
+[Website](https://project-beatrice.vercel.app) · [Beatrice for Mac](https://github.com/satiricalguru/Beatrice-voicechanger-mac) · [Beatrice for Windows](https://github.com/satiricalguru/Beatrice-voicechanger-windows) · [Trainer for Windows](https://github.com/Project-Beatrice-V2/Beatrice-trainer-windows) · [Report a bug](https://github.com/Project-Beatrice-V2/Beatrice-trainer-macos/issues/new)
 
----
+<br/>
 
-## 🖼️ Interface Showcase
+<img src="docs/media/trainer-demo.gif" alt="Beatrice Trainer: dashboard, dataset, a training run with the live loss chart, models, cloud notebooks and light mode" width="100%" />
 
-<p align="center">
-  <img src="assets/dashboard.png" alt="Beatrice V2 Dashboard Overview" width="95%" style="border-radius: 10px; border: 1px solid rgba(255,255,255,0.1);" />
-  <br><sub><b>Dashboard Overview</b> — Live hardware monitor, memory allocation gauges, and system diagnostics</sub>
-</p>
-
-<p align="center">
-  <img src="assets/dataset.png" alt="Beatrice V2 Dataset Manager" width="95%" style="border-radius: 10px; border: 1px solid rgba(255,255,255,0.1);" />
-  <br><sub><b>Dataset Manager</b> — Single-choice import selector (Local Audio Drag & Drop, Hugging Face, Kaggle)</sub>
-</p>
-
-<p align="center">
-  <img src="assets/training.png" alt="Beatrice V2 Training Control" width="95%" style="border-radius: 10px; border: 1px solid rgba(255,255,255,0.1);" />
-  <br><sub><b>Training Control</b> — Hardware auto-tuning, custom training steps, and live console logger</sub>
-</p>
-
-<p align="center">
-  <img src="assets/colab.png" alt="Cloud Training Launchpad" width="95%" style="border-radius: 10px; border: 1px solid rgba(255,255,255,0.1);" />
-  <br><sub><b>Cloud Training Launchpad</b> — One-click Google Colab and Kaggle launch cards with local .ipynb downloads</sub>
-</p>
+</div>
 
 ---
 
-## ⚡ Quick Start
+## ✨ Why Beatrice Trainer
 
-### 📋 Prerequisites
+- 🎙️ **A real Beatrice model of your voice.** It runs the upstream [Beatrice trainer](https://huggingface.co/fierce-cats/beatrice-trainer) on your recordings. There is no fake or "demo" training mode: if the trainer can't run, you see why.
+- 🍎 **Uses your Mac's GPU.** On Apple Silicon it trains through PyTorch's MPS backend, and auto-tuning picks the batch size from your unified memory.
+- 📥 **Three ways to add audio.** Drag in WAV or ZIP files, or import a dataset from Hugging Face or Kaggle.
+- 📈 **Watch it learn.** Live step count, loss chart, time left and the trainer's own console output, in a browser tab that keeps working while you switch pages.
+- 📦 **One click to Beatrice.** Download the finished model as a ZIP and import it into the voice changer with **Upload Custom Model**.
+- ☁️ **No fast GPU?** Ready-made [Colab and Kaggle notebooks](https://github.com/Project-Beatrice-V2/Beatrice-colab) train in the cloud for free.
 
-* **Operating System**: macOS 12 (Monterey) or newer (macOS 13+ recommended for optimal Metal MPS support).
-* **Hardware**: Apple Silicon (M1/M2/M3/M4 Base/Pro/Max/Ultra) or Intel Mac.
-* **Interpreter**: Python 3.10 or newer (`python3 --version`).
+## 📸 Tour
 
-### 💻 One-Click Execution
+<table>
+  <tr>
+    <td width="50%"><img src="docs/media/trainer-training.jpg" alt="Training page with step, loss, time left, speed, a loss chart and the console" /></td>
+    <td width="50%"><img src="docs/media/trainer-dataset.jpg" alt="Dataset page with the drop zone and the list of speakers" /></td>
+  </tr>
+  <tr>
+    <td><b>Training</b><br/>Progress, loss and the trainer's console output, updated every two seconds.</td>
+    <td><b>Dataset</b><br/>Name the speaker and add audio from your disk, Hugging Face or Kaggle.</td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/media/trainer-models.jpg" alt="Models page listing trained voice models and checkpoints" /></td>
+    <td width="50%"><img src="docs/media/trainer-cloud.jpg" alt="Cloud training page with Colab and Kaggle notebooks" /></td>
+  </tr>
+  <tr>
+    <td><b>Models</b><br/>Download a voice model as a ZIP for the voice changer, or keep the checkpoints.</td>
+    <td><b>Cloud training</b><br/>Open the notebooks in Colab or Kaggle and package your dataset for upload.</td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/media/trainer-dashboard-light.jpg" alt="Dashboard in light mode" /></td>
+    <td width="50%"><img src="docs/media/trainer-error.jpg" alt="Training page showing a clear training failed message" /></td>
+  </tr>
+  <tr>
+    <td><b>Light mode</b><br/>Dark, light or follow the system.</td>
+    <td><b>Honest errors</b><br/>If training can't start or crashes, the reason and a fix are shown right away.</td>
+  </tr>
+</table>
 
-Open Terminal and execute `start.sh`:
+<sub>Screenshots and the demo use sample data served by a local mock of the trainer API.</sub>
 
-```bash
-chmod +x start.sh
-./start.sh
+## 🚀 Get started
+
+1. **Install Python 3.12** from [python.org](https://www.python.org/downloads/) (3.10 to 3.13 work).
+2. **Install the Xcode command line tools** once, so `pyworld` can be compiled:
+   ```bash
+   xcode-select --install
+   ```
+3. **Download and start the trainer:**
+   ```bash
+   git clone https://github.com/Project-Beatrice-V2/Beatrice-trainer-macos.git
+   cd Beatrice-trainer-macos
+   ./start.sh
+   ```
+4. Your browser opens **http://127.0.0.1:8000**. Next time, just run `./start.sh` again.
+
+`start.sh` creates a `venv`, installs `requirements.txt` (PyTorch and the trainer's dependencies, several hundred MB the first time), downloads the trainer's pretrained weights from Hugging Face with `python server.py --setup`, then starts the server. Set `BEATRICE_NO_BROWSER=1` to stop it opening a browser tab.
+
+> [!NOTE]
+> **An Apple Silicon Mac (M1 or later) is recommended.** Training uses the GPU through PyTorch MPS. Without it, training runs on the CPU and is very slow; use the [cloud notebooks](https://github.com/Project-Beatrice-V2/Beatrice-colab) instead.
+
+## 🧩 How training works
+
+```mermaid
+flowchart LR
+  rec([🎙️ Recordings]) --> ds
+  subgraph trainer [Beatrice Trainer · 127.0.0.1:8000]
+    ds[Dataset<br/>beatrice-trainer/data/&lt;speaker&gt;] --> train[Training<br/>beatrice_trainer on MPS or CPU]
+    train --> out[Model folder<br/>paraphernalia_*]
+  end
+  out -- Download ZIP --> zip([model .zip])
+  zip -- Upload Custom Model --> app([Beatrice voice changer])
 ```
 
-#### What the Startup Script Automates:
-1. Creates a local Python virtual environment (`venv/`).
-2. Installs macOS PyTorch with Apple MPS (Metal) backend support.
-3. Installs backend dependencies (`fastapi`, `uvicorn`, `python-multipart`, `aiofiles`, `huggingface_hub`, `psutil`).
-4. Downloads the core **Beatrice Trainer** repository from Hugging Face (`fierce-cats/beatrice-trainer`).
-5. Launches the FastAPI backend server and automatically opens your browser at **`http://localhost:8000`**.
+1. **Dataset.** Enter a speaker name and add WAV files (ZIPs are unpacked), or import a Hugging Face or Kaggle dataset. Files go to `beatrice-trainer/data/<speaker>/`.
+2. **Train.** Pick the speaker on the Training page. Auto-tune fills in batch size, gradient accumulation and workers for your Mac; change them under *Advanced settings*. Press **Start training**.
+3. **Export.** When the run finishes, open **Models** and click **Download ZIP** next to the voice model. Checkpoints (`.pt.gz`) stay in `beatrice-trainer/output/<speaker>/`.
+4. **Use it.** In the [Beatrice voice changer](https://github.com/satiricalguru/Beatrice-voicechanger-mac), open the model menu, choose **Upload Custom Model** and pick the ZIP.
 
----
+## 💻 Requirements
 
-## 🎮 macOS Hardware Auto-Tuning Matrix
+| | |
+|:--|:--|
+| **Mac** | Apple Silicon (M1 or later) recommended. Intel Macs train on the CPU only, which is very slow. |
+| **macOS** | A version supported by current PyTorch; the MPS GPU backend needs macOS 12.3 or later |
+| **Memory** | 16 GB or more is comfortable. Auto-tune lowers the batch size on 8 GB Macs. |
+| **Python** | 3.10 to 3.13 (3.12 recommended) |
+| **Disk** | A few GB for PyTorch, the trainer weights (about 175 MB) and your datasets and checkpoints |
 
-When selecting a speaker dataset in the **Training** tab, the system profiles Apple Silicon unified memory to compute optimal parameters:
+<details>
+<summary><b>Troubleshooting</b></summary>
+<br/>
 
-| Apple Silicon / RAM | Unified Memory Budget | Batch Size | Grad Accum | Effective Batch | Workers | Backend |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Max / Ultra (36GB+ RAM)** | ~32 GB | 16 | 1 | 16 | 0 | MPS (Metal) |
-| **Pro / Max (16GB - 32GB RAM)** | ~12 - 24 GB | 8 | 2 | 16 | 0 | MPS (Metal) |
-| **Base Chip (8GB - 16GB RAM)** | ~4 - 12 GB | 4 | 4 | 16 | 0 | MPS (Metal) |
-| **Intel / CPU Fallback** | System RAM | 2 | 4 | 8 | 2 | CPU |
+**Training finished instantly, or said "complete" straight away (fixed).**
+Older versions quietly ran a stand-in "benchmark" loop when the real trainer couldn't start, so a run could look finished without training anything. That fallback is gone: the real trainer runs, and if it can't, the Training page shows **Training could not start** or **Training failed** with the reason. Update (`git pull`) and run `./start.sh` again.
 
----
+**"The Beatrice trainer is not ready".**
+Weights or packages are missing. Run `./start.sh` again, or open **Settings** and click **Download or update trainer**.
 
-## 📂 Directory Structure
+**Installing requirements fails while building `pyworld`.**
+Install the Xcode command line tools with `xcode-select --install`, then run `./start.sh` again.
 
-```text
-├── assets/                          # App branding and logo assets
-│   └── logo.jpg                     # Official Project Beatrice V2 Logo
-├── colab_repo/                      # Cloned Beatrice-Colab repository
-│   ├── BeatriceV2_Trainer_Notebook_Colab.ipynb
-│   └── BeatriceV2_Trainer_Notebook_Kaggle.ipynb
-├── app.js                           # Client-side JavaScript application & UI handlers
-├── index.html                       # Modern HTML layout & component views
-├── index.css                        # Cyan Blue Design System & Light/Dark themes
-├── server.py                        # FastAPI Mac-optimized backend server
-├── start.sh                         # Automated macOS shell startup script
-├── requirements.txt                 # Backend Python dependencies
-├── README.md                        # Product documentation manual
-└── beatrice-trainer/                # Downloaded Hugging Face trainer files
+**"Python … is too old".**
+Install Python 3.12 from python.org, delete the `venv` folder and run `./start.sh` again.
+
+**Out of memory during training.**
+Lower **Batch size** under *Advanced settings* on the Training page, then start again.
+
+**The browser didn't open, or port 8000 is busy.**
+Open http://127.0.0.1:8000 yourself. To use another port, start with `BEATRICE_PORT=8001 ./start.sh`.
+</details>
+
+<details>
+<summary><b>Project layout</b></summary>
+<br/>
+
 ```
+server.py           FastAPI server: API and the web UI on 127.0.0.1:8000
+index.html          Web UI layout
+index.css           The Aurora Void design system (dark and light)
+app.js              Web UI logic: datasets, training, models, settings
+fonts/              Geist and Geist Mono (SIL OFL)
+start.sh            Sets up the venv, installs packages, downloads weights, starts the server
+beatrice-trainer/   The Beatrice trainer (fierce-cats/beatrice-trainer) plus webui_runner.py
+colab_repo/         The Colab and Kaggle notebooks
+```
+</details>
 
----
+## 🌐 The Beatrice family
 
-## 🌐 API Endpoint Reference
+| | |
+|:--|:--|
+| 🍎 [Beatrice for Mac](https://github.com/satiricalguru/Beatrice-voicechanger-mac) | The real-time voice changer that uses your models |
+| 🪟 [Beatrice for Windows](https://github.com/satiricalguru/Beatrice-voicechanger-windows) | The same app for Windows 10 and 11 |
+| 🌍 [Website](https://project-beatrice.vercel.app) | Downloads, guides and voice samples |
+| 🧠 [Trainer for Windows](https://github.com/Project-Beatrice-V2/Beatrice-trainer-windows) · [Colab](https://github.com/Project-Beatrice-V2/Beatrice-colab) | Train on a Windows PC or in the cloud |
+| 📂 [Dataset Web UI](https://github.com/Project-Beatrice-V2/Beatrice-dataset-webui-macos) | Prepare recordings for training |
+| 🎭 [Voice models](https://github.com/Project-Beatrice-V2/Beatrice-voice-models) | Ready-made models to import |
 
-| Endpoint | Method | Description |
-| :--- | :---: | :--- |
-| `/api/status` | `GET` | System health check & backend availability |
-| `/api/system/memory` | `GET` | Live RAM, MPS GPU, and CPU usage metrics |
-| `/api/dataset/list` | `GET` | List available speaker datasets and file counts |
-| `/api/dataset/upload` | `POST` | Upload WAV or ZIP audio files |
-| `/api/dataset/import/hf` | `POST` | Download dataset directly from Hugging Face |
-| `/api/dataset/import/kaggle` | `POST` | Import dataset from Kaggle |
-| `/api/train/auto-tune` | `POST` | Compute optimal training hyperparameters |
-| `/api/train/start` | `POST` | Launch local model training process |
-| `/api/train/stop` | `POST` | Terminate active model training process |
-| `/api/models/list` | `GET` | List trained VST3 paraphernalia voice models |
+## 🙏 Credits
 
----
+- **Beatrice trainer** by Project Beatrice: [fierce-cats/beatrice-trainer](https://huggingface.co/fierce-cats/beatrice-trainer) (MIT)
+- **Beatrice engine** by [prj-beatrice](https://github.com/prj-beatrice/beatrice-vst)
+- **Geist** and **Geist Mono** by Vercel (SIL Open Font License, see `fonts/OFL-Geist.txt`)
 
-## 📄 License
+## 📜 License
 
-This project is licensed under the [MIT License](LICENSE).
+The web UI and server are **MIT** licensed, © 2026 Project Beatrice V2 (see [LICENSE](LICENSE)). The Beatrice trainer in `beatrice-trainer/` is MIT licensed by Project Beatrice; the fonts are under the SIL Open Font License.
+
+<div align="center">
+<br/>
+
+**If you trained a voice you love, ⭐ star the repo, it really helps.**
+
+<a href="#beatrice-trainer-for-mac">Back to top ↑</a>
+
+</div>

@@ -1,22 +1,35 @@
 """
-Beatrice V2 Trainer — Mac-Optimized Backend Server
-====================================================
-FastAPI server heavily optimized for macOS training with
-Apple MPS (Metal), unified memory management, and
-automatic hardware-aware configuration.
+Beatrice V2 Trainer - Mac backend server
+========================================
+FastAPI server behind the Beatrice V2 trainer web UI on macOS.
+
+Training always runs the real ``beatrice_trainer`` package
+(``beatrice-trainer/beatrice_trainer``) in a subprocess started through
+``beatrice-trainer/webui_runner.py``; on Apple Silicon it uses MPS (Metal),
+otherwise the CPU. There is no simulated / fallback training: if the trainer
+cannot start, ``/api/train/status`` reports ``state: "failed"`` with an
+``error`` message.
+
+Run ``python server.py --setup`` to download the trainer's pretrained weights
+and audio assets from Hugging Face (``fierce-cats/beatrice-trainer``).
 """
 
-import os
-import sys
 import gc
-import glob
+import importlib
+import importlib.util
+import io
 import json
 import math
-import shutil
-import signal
+import os
 import platform
+import shutil
+import socket
 import subprocess
+import sys
+import tempfile
+import threading
 import time
+import webbrowser
 import zipfile
 try:
     import psutil
@@ -27,17 +40,58 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.background import BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 import uvicorn
 
 # ---------- Configuration ----------
+PLATFORM_LABEL = "Mac"
 BASE_DIR = Path(__file__).parent.resolve()
 BEATRICE_DIR = BASE_DIR / "beatrice-trainer"
-DATA_DIR = BEATRICE_DIR / "data"
-OUTPUT_DIR = BEATRICE_DIR / "output"
-HF_REPO = "https://huggingface.co/fierce-cats/beatrice-trainer"
+DATA_DIR = BEATRICE_DIR / "data"            # one sub-folder of WAVs per speaker
+OUTPUT_DIR = BEATRICE_DIR / "output"        # trained models, one sub-folder per speaker
+STAGING_DIR = BEATRICE_DIR / "data_active"  # per-run dataset view handed to the trainer
+WORK_DIR = BEATRICE_DIR / "work"            # per-run config, job and status files
+TRAINER_MAIN = BEATRICE_DIR / "beatrice_trainer" / "__main__.py"
+TRAINER_RUNNER = BEATRICE_DIR / "webui_runner.py"
+DEFAULT_CONFIG_FILE = BEATRICE_DIR / "assets" / "default_config.json"
+TRAINER_STDOUT_LOG = BASE_DIR / "trainer_stdout.log"
+STATUS_FILE = WORK_DIR / "training_status.json"
+
+HF_REPO_ID = "fierce-cats/beatrice-trainer"
+HF_REPO = f"https://huggingface.co/{HF_REPO_ID}"
+# Binary assets the trainer needs. They are downloaded from Hugging Face (never
+# committed: Git LFS pointer stubs of these files used to be in the repo).
+TRAINER_ASSET_PATTERNS = [
+    "assets/pretrained/*",
+    "assets/ir/*.flac",
+    "assets/noise/-*.flac",
+    "assets/test/*.wav",
+    "assets/images/noimage.png",
+]
+PRETRAINED_CONFIG_KEYS = ("phone_extractor_file", "pitch_estimator_file", "pretrained_file")
+DEFAULT_PRETRAINED_FILES = {
+    "phone_extractor_file": "assets/pretrained/122_checkpoint_03000000.pt",
+    "pitch_estimator_file": "assets/pretrained/104_3_checkpoint_00300000.pt",
+    "pretrained_file": "assets/pretrained/151_checkpoint_libritts_r_200_02750000.pt.gz",
+}
+MIN_PRETRAINED_BYTES = 1_000_000
+LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec/"
+MIN_PYTHON = (3, 10)
+REQUIRED_TRAINER_MODULES = ("numpy", "torch", "torchaudio", "soundfile", "pyworld", "tqdm", "tensorboard")
+AUDIO_SUFFIXES = (".wav", ".flac")
+
+# Bind to loopback by default: the API can delete data and start processes.
+# Set BEATRICE_HOST=0.0.0.0 only if you really want it reachable from your LAN.
+HOST = os.environ.get("BEATRICE_HOST", "127.0.0.1")
+try:
+    PORT = int(os.environ.get("BEATRICE_PORT", "8000"))
+except ValueError:
+    PORT = 8000
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 # Ensure dirs exist
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -46,33 +100,55 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # ---------- App ----------
 app = FastAPI(
     title="Beatrice V2 Trainer API",
-    description="Mac-optimized backend for Beatrice V2 Voice Conversion Trainer",
-    version="2.0.0",
+    description=f"{PLATFORM_LABEL} backend for the Beatrice V2 voice conversion trainer",
+    version="2.1.0",
 )
 
+# The UI is served from this same server, so CORS is only needed for a UI
+# opened from another local port. Never allow arbitrary websites to call it.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$",
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+if HOST in LOOPBACK_HOSTS:
+    # Blocks DNS-rebinding attacks from web pages against the local API.
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1"])
 
 # ---------- Training State ----------
 training_process: Optional[subprocess.Popen] = None
-training_state = {
-    "active": False,
-    "speaker": None,
-    "step": 0,
-    "total_steps": 0,
-    "loss": None,
-    "start_time": None,
-    "log_file": None,
-    "memory_usage": None,
-    "steps_per_sec": None,
-}
+training_lock = threading.Lock()
 
-# ---------- Hugging Face Import State ----------
+
+def _idle_training_state():
+    return {
+        "active": False,
+        "state": "idle",          # idle | starting | running | completed | failed | stopped
+        "completed": False,
+        "error": None,
+        "exit_code": None,
+        "phase": None,
+        "speaker": None,
+        "step": 0,
+        "total_steps": 0,
+        "loss": None,
+        "start_time": None,
+        "end_time": None,
+        "memory_usage": None,
+        "steps_per_sec": None,
+        "eta_seconds": None,
+        "device": None,
+        "output_dir": None,
+        "pid": None,
+        "notes": [],
+    }
+
+
+training_state = _idle_training_state()
+
+# ---------- Hugging Face / Kaggle Import State ----------
 hf_import_state = {
     "active": False,
     "status": "",
@@ -81,10 +157,196 @@ hf_import_state = {
 }
 
 
+# ==================== HELPERS ====================
+
+def clean_speaker_name(raw) -> str:
+    """Speaker names become folder names: letters, digits, '-' and '_' only."""
+    name = "".join(c for c in str(raw or "").strip() if c.isalnum() or c in "-_")[:64]
+    if not name:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid speaker name. Use letters, numbers, '-' and '_' only.",
+        )
+    return name
+
+
+def safe_filename(raw, default: str) -> str:
+    """Reduce an uploaded/archived file name to a safe base name (no paths)."""
+    base = os.path.basename(str(raw or "").replace("\\", "/")).strip()
+    base = "".join(c for c in base if ord(c) >= 32 and c not in '<>:"/\\|?*')
+    if not base or base.startswith(".") or base in ("..",):
+        base = default
+    return base[:200]
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _is_lfs_pointer(path: Path) -> bool:
+    try:
+        if path.stat().st_size > 1024:
+            return False
+        with open(path, "rb") as f:
+            return f.read(len(LFS_POINTER_PREFIX)) == LFS_POINTER_PREFIX
+    except OSError:
+        return False
+
+
+def _is_real_file(path: Path, min_bytes: int = 1) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size >= min_bytes and not _is_lfs_pointer(path)
+    except OSError:
+        return False
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _tail_lines(path: Path, n: int = 15) -> list:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines[-n:]:
+        if "\r" in line:
+            line = line.split("\r")[-1]
+        line = line.rstrip()
+        if line:
+            out.append(line)
+    return out
+
+
+def _training_running() -> bool:
+    return training_process is not None and training_process.poll() is None
+
+
+def _require_not_training(what: str):
+    if _training_running():
+        raise HTTPException(status_code=409, detail=f"Cannot {what} while training is running. Stop training first.")
+
+
+def _audio_files(folder: Path) -> list:
+    if not folder.is_dir():
+        return []
+    return sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".wav")
+
+
+# ---------- Trainer installation checks ----------
+
+def pretrained_paths() -> list:
+    cfg = _read_json(DEFAULT_CONFIG_FILE)
+    return [BEATRICE_DIR / str(cfg.get(key) or DEFAULT_PRETRAINED_FILES[key]) for key in PRETRAINED_CONFIG_KEYS]
+
+
+def find_lfs_pointer_stubs() -> list:
+    assets = BEATRICE_DIR / "assets"
+    if not assets.is_dir():
+        return []
+    return [p for p in assets.rglob("*") if p.is_file() and _is_lfs_pointer(p)]
+
+
+def trainer_asset_problems() -> list:
+    """Human-readable reasons the trainer code/assets are not usable (empty = OK)."""
+    problems = []
+    if not TRAINER_MAIN.is_file():
+        problems.append("trainer code is missing (beatrice-trainer/beatrice_trainer/__main__.py); re-download this repository")
+    if not TRAINER_RUNNER.is_file():
+        problems.append("beatrice-trainer/webui_runner.py is missing; re-download this repository")
+    if not DEFAULT_CONFIG_FILE.is_file():
+        problems.append("beatrice-trainer/assets/default_config.json is missing; re-download this repository")
+    for p in pretrained_paths():
+        if not _is_real_file(p, MIN_PRETRAINED_BYTES):
+            problems.append(f"pretrained weights not downloaded: {p.relative_to(BEATRICE_DIR).as_posix()}")
+    for sub in ("ir", "noise", "test"):
+        d = BEATRICE_DIR / "assets" / sub
+        has_audio = d.is_dir() and any(
+            _is_real_file(f, 64) for f in d.iterdir() if f.suffix.lower() in AUDIO_SUFFIXES
+        )
+        if not has_audio:
+            problems.append(f"trainer audio assets not downloaded: assets/{sub}/")
+    if not _is_real_file(BEATRICE_DIR / "assets" / "images" / "noimage.png", 64):
+        problems.append("trainer asset not downloaded: assets/images/noimage.png")
+    stubs = find_lfs_pointer_stubs()
+    if stubs:
+        problems.append(f"{len(stubs)} Git LFS pointer stub file(s) in beatrice-trainer/assets instead of real files")
+    return problems
+
+
+def missing_trainer_modules() -> list:
+    return [m for m in REQUIRED_TRAINER_MODULES if importlib.util.find_spec(m) is None]
+
+
+def trainer_setup_problems() -> list:
+    problems = trainer_asset_problems()
+    if sys.version_info < MIN_PYTHON:
+        problems.append(
+            f"Python {sys.version.split()[0]} is too old: the trainer needs Python 3.10 - 3.13 "
+            "(its UTMOS quality-check model uses 3.10 syntax). Delete the venv folder and re-run "
+            "the start script with a newer Python"
+        )
+    missing = missing_trainer_modules()
+    if missing:
+        problems.append(
+            "missing Python packages: " + ", ".join(missing)
+            + " (run the start script again, or: pip install -r requirements.txt)"
+        )
+    return problems
+
+
+def download_trainer_assets(log=print) -> dict:
+    """Download pretrained weights + audio assets from Hugging Face into beatrice-trainer/."""
+    if not TRAINER_MAIN.is_file():
+        raise RuntimeError(
+            "The trainer code (beatrice-trainer/beatrice_trainer/__main__.py) is missing from this "
+            "folder. Re-download the repository; it ships a patched trainer that reports progress."
+        )
+    removed = 0
+    for stub in find_lfs_pointer_stubs():
+        stub.unlink()
+        removed += 1
+    for p in pretrained_paths():
+        if p.exists() and not _is_real_file(p, MIN_PRETRAINED_BYTES):
+            p.unlink()
+            removed += 1
+    if removed:
+        log(f"Removed {removed} placeholder / incomplete asset file(s).")
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as e:
+        raise RuntimeError("huggingface_hub is not installed. Run: pip install -r requirements.txt") from e
+
+    log(f"Downloading trainer assets from {HF_REPO} (about 190 MB the first time) ...")
+    snapshot_download(
+        repo_id=HF_REPO_ID,
+        local_dir=str(BEATRICE_DIR),
+        allow_patterns=TRAINER_ASSET_PATTERNS,
+        max_workers=8,
+    )
+    problems = trainer_asset_problems()
+    if problems:
+        raise RuntimeError("Download finished but the trainer is still incomplete: " + "; ".join(problems))
+    log("Trainer assets are ready.")
+    return {"removed_placeholders": removed}
+
+
 # ==================== MAC HARDWARE PROFILING ====================
 
-def get_mac_hardware_info():
-    """Deep profiling of Mac hardware for optimal training config."""
+def get_hardware_info():
+    """Profile the Mac hardware for training config recommendations."""
     info = {
         "platform": platform.platform(),
         "machine": platform.machine(),
@@ -105,7 +367,7 @@ def get_mac_hardware_info():
         "unified_memory": False,
     }
 
-    # Physical CPU count (important for num_workers)
+    # Physical CPU count and RAM
     try:
         import psutil
         info["cpu_count_physical"] = psutil.cpu_count(logical=False) or info["cpu_count"]
@@ -134,7 +396,6 @@ def get_mac_hardware_info():
     # Apple Silicon has unified memory (GPU shares RAM)
     if info["is_apple_silicon"]:
         info["unified_memory"] = True
-        # Detect chip variant from sysctl
         try:
             result = subprocess.run(
                 ["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True
@@ -153,7 +414,6 @@ def get_mac_hardware_info():
         if info["torch_mps_built"] and torch.backends.mps.is_available():
             info["mps_available"] = True
             info["compute_backend"] = "mps"
-            # MPS is recommended on Apple Silicon with macOS 12.3+
             if info["is_apple_silicon"]:
                 info["mps_recommended"] = True
                 info["gpu_name"] = info["gpu_name"] or "Apple GPU (MPS)"
@@ -166,34 +426,34 @@ def get_mac_hardware_info():
     return info
 
 
+get_mac_hardware_info = get_hardware_info  # backwards-compatible name
+
+
 def get_optimal_training_config(hw_info: dict, num_audio_files: int = 100):
     """
-    Auto-calculate optimal training parameters based on Mac hardware.
+    Recommend training parameters for this Mac.
 
-    Key Mac optimizations:
-    - MPS batch size tuned to unified memory budget
-    - Gradient accumulation to simulate larger effective batch
-    - num_workers tuned to physical cores (not logical)
-    - Memory-efficient data loading with pin_memory=False for MPS
-    - Reduced precision (float16) on MPS where supported
+    Only settings the real beatrice_trainer understands are tuned (batch size,
+    data loader workers, mixed precision, torch.compile). beatrice_trainer has
+    no gradient accumulation, so gradient_accumulation_steps is always 1.
     """
     ram_gb = hw_info.get("ram_total_gb", 8)
     is_mps = hw_info.get("mps_available", False)
-    is_silicon = hw_info.get("is_apple_silicon", False)
-    cpu_physical = hw_info.get("cpu_count_physical") or hw_info.get("cpu_count", 1)
 
     config = {
         "device": "mps" if is_mps else "cpu",
         "batch_size": 2,
-        "gradient_accumulation_steps": 4,
-        "effective_batch_size": 8,
-        "num_workers": 0,  # MPS works best with 0 workers on macOS
-        "pin_memory": False,  # Must be False for MPS
+        "gradient_accumulation_steps": 1,
+        "effective_batch_size": 2,
+        # macOS starts DataLoader workers with "spawn"; they cannot import the
+        # trainer's dataset classes (defined in beatrice_trainer/__main__.py).
+        "num_workers": 0,
+        "pin_memory": False,
         "mixed_precision": False,
-        "learning_rate": "1e-4",
+        "learning_rate": "5.0e-05",
         "max_steps": 10000,
-        "save_every": 1000,
-        "log_every": 50,
+        "save_every": 2000,
+        "log_every": 1,
         "max_memory_gb": 0,
         "prefetch_factor": None,
         "persistent_workers": False,
@@ -204,118 +464,112 @@ def get_optimal_training_config(hw_info: dict, num_audio_files: int = 100):
         "optimization_notes": [],
     }
 
-    # ----- Batch size based on available memory -----
     if is_mps:
-        # Apple unified memory — GPU shares RAM
-        # Reserve ~4GB for system + app, rest for training
+        # Apple unified memory: the GPU shares RAM. Reserve ~4 GB for the system.
         gpu_budget_gb = max(1, ram_gb - 4)
         config["max_memory_gb"] = round(gpu_budget_gb, 1)
 
-        if gpu_budget_gb >= 24:      # M2 Ultra / M3 Max 64GB+
+        if gpu_budget_gb >= 24:      # 32 GB+ Macs
             config["batch_size"] = 16
-            config["gradient_accumulation_steps"] = 1
-        elif gpu_budget_gb >= 12:    # M1/M2 Pro 16GB, M2 Max 32GB
+        elif gpu_budget_gb >= 12:    # 16-24 GB Macs
             config["batch_size"] = 8
-            config["gradient_accumulation_steps"] = 2
-        elif gpu_budget_gb >= 6:     # M1/M2 8GB
+        elif gpu_budget_gb >= 6:     # 8-12 GB Macs
             config["batch_size"] = 4
-            config["gradient_accumulation_steps"] = 2
-        elif gpu_budget_gb >= 3:     # M1 8GB tight
-            config["batch_size"] = 2
-            config["gradient_accumulation_steps"] = 4
         else:
-            config["batch_size"] = 1
-            config["gradient_accumulation_steps"] = 8
+            config["batch_size"] = 2
 
-        config["effective_batch_size"] = config["batch_size"] * config["gradient_accumulation_steps"]
-
-        # MPS-specific optimizations
-        config["pin_memory"] = False  # CRITICAL: pin_memory must be False for MPS
-        config["num_workers"] = 0  # CRITICAL: Must be 0 on macOS to avoid runpy pickling errors in multiprocessing
-        config["persistent_workers"] = False
-        config["prefetch_factor"] = None
-
-        # Float16 on MPS — disabled due to numerical instability in pitch features (STFT) causing AssertionError NaNs on Apple Silicon
-        config["mixed_precision"] = False
         config["optimization_notes"].append(
-            "⚠️ Float16 mixed precision disabled to prevent NaN errors in feature extraction"
+            f"Apple MPS (Metal) detected - GPU memory budget {gpu_budget_gb:.0f} GB of {ram_gb:.0f} GB unified memory"
         )
-
-        # torch.compile on MPS — experimental, only on PyTorch 2.4+
-        try:
-            import torch
-            major_ver = int(torch.__version__.split(".")[0])
-            minor_ver = int(torch.__version__.split(".")[1])
-            if major_ver >= 2 and minor_ver >= 4:
-                config["compile_model"] = True
-                config["optimization_notes"].append(
-                    "✅ torch.compile() enabled for MPS (PyTorch 2.4+)"
-                )
-        except Exception:
-            pass
-
-        # channels_last memory format — faster on Apple GPU
-        config["channels_last"] = True
         config["optimization_notes"].append(
-            "✅ Channels-last memory format for Apple GPU acceleration"
+            "Mixed precision (float16) off: it produces NaNs in the pitch features on Apple GPUs"
         )
-
-        config["optimization_notes"].insert(0,
-            f"🍎 Apple MPS detected — GPU budget: {gpu_budget_gb:.0f} GB of {ram_gb:.0f} GB unified"
+        config["optimization_notes"].append(
+            "torch.compile off: it breaks the discriminator backward pass on MPS"
         )
-
     else:
-        # CPU-only mode
         config["batch_size"] = min(4, max(1, int(ram_gb / 4)))
-        config["gradient_accumulation_steps"] = max(1, 8 // config["batch_size"])
-        config["effective_batch_size"] = config["batch_size"] * config["gradient_accumulation_steps"]
-        config["num_workers"] = max(0, min(4, cpu_physical - 1))
-        config["pin_memory"] = False
-        config["persistent_workers"] = config["num_workers"] > 0
-        config["prefetch_factor"] = 2 if config["num_workers"] > 0 else None
         config["max_memory_gb"] = round(ram_gb * 0.5, 1)
-
         config["optimization_notes"].append(
-            f"⚠️ CPU-only mode — consider using Colab (GPU) for faster training"
-        )
-        # Use all cores for CPU parallelism
-        config["optimization_notes"].append(
-            f"📊 Using {config['num_workers']} data workers on {cpu_physical} physical cores"
+            "CPU-only mode - training will be slow; consider the Colab notebook (GPU)"
         )
 
-    # ----- Steps recommendation based on dataset size -----
+    config["effective_batch_size"] = config["batch_size"]
+    config["optimization_notes"].append(
+        "Data loader workers: 0 (worker processes are not supported by the trainer on macOS)"
+    )
+
+    # Steps recommendation based on dataset size
     if num_audio_files < 30:
         config["recommended_steps_for_dataset"] = 5000
     else:
         config["recommended_steps_for_dataset"] = 10000
-
     config["max_steps"] = config["recommended_steps_for_dataset"]
 
-    # ----- Time estimation -----
-    # Rough benchmarks: MPS ~3-8 steps/sec, CPU ~0.5-2 steps/sec
+    # Rough time estimate. Measured: Apple M2 (16 GB), MPS, batch 4 -> ~0.2 steps/s
+    # (about 5 s per step, plus evaluation/saving every save_interval steps).
     if is_mps:
-        steps_per_sec = 4.0 if ram_gb >= 16 else 2.5
+        steps_per_sec = 0.2 * 4 / config["batch_size"] if ram_gb < 32 else 0.4 * 4 / config["batch_size"]
     else:
-        steps_per_sec = 0.8
+        steps_per_sec = 0.05
     config["estimated_time_minutes"] = round(config["max_steps"] / steps_per_sec / 60, 1)
 
-    # ----- Learning rate scaling -----
-    # Linear scaling rule: lr scales with effective batch size
-    base_lr = 1e-4
-    base_batch = 8
-    scaled_lr = base_lr * (config["effective_batch_size"] / base_batch)
+    # Learning rate: upstream default is 5e-5 at batch size 8; scale linearly.
+    scaled_lr = 5e-5 * (config["batch_size"] / 8)
     config["learning_rate"] = f"{scaled_lr:.1e}"
 
     return config
 
 
+def trainer_env() -> dict:
+    """Extra environment variables for the trainer subprocess on macOS."""
+    return {
+        "PYTORCH_ENABLE_MPS_FALLBACK": "1",
+        "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.0",
+    }
+
+
+def _get_memory_platform(mem: dict):
+    """Mac part of /api/system/memory."""
+    if "ram_total_gb" not in mem:
+        try:
+            result = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True)
+            if result.returncode == 0:
+                mem["ram_total_gb"] = round(int(result.stdout.strip()) / (1024**3), 2)
+            result = subprocess.run(["vm_stat"], capture_output=True, text=True)
+            if result.returncode == 0:
+                page_size = 16384  # default on Apple Silicon
+                free = 0
+                for line in result.stdout.split("\n"):
+                    if "page size" in line.lower():
+                        page_size = int("".join(filter(str.isdigit, line)))
+                    if "Pages free" in line:
+                        free = int("".join(filter(str.isdigit, line))) * page_size
+                mem["ram_available_gb"] = round(free / (1024**3), 2)
+                mem["ram_used_gb"] = round(mem.get("ram_total_gb", 8) - mem["ram_available_gb"], 2)
+                mem["ram_percent"] = round(mem["ram_used_gb"] / mem.get("ram_total_gb", 8) * 100, 1)
+        except Exception:
+            pass
+
+    # MPS memory as seen by this server process (training runs in a subprocess,
+    # whose memory is reported as memory_usage_mb by /api/train/status).
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            mem["mps_allocated_gb"] = round(torch.mps.current_allocated_memory() / (1024**3), 3)
+            mem["mps_driver_allocated_gb"] = round(torch.mps.driver_allocated_memory() / (1024**3), 3)
+    except Exception:
+        pass
+
+
 # ==================== ENDPOINTS ====================
 
-# --- System Status (Mac-optimized) ---
+# --- System Status ---
 @app.get("/api/status")
-async def get_status():
-    """Return deep Mac hardware profiling and system status."""
-    hw = get_mac_hardware_info()
+def get_status():
+    """Hardware profile, system status and trainer installation state."""
+    hw = get_hardware_info()
+    problems = trainer_setup_problems()
     return {
         "status": "online",
         "platform": hw["platform"],
@@ -332,19 +586,19 @@ async def get_status():
         "cpu_count_physical": hw["cpu_count_physical"],
         "python": sys.version.split()[0],
         "torch_version": hw["torch_version"],
-        "beatrice_installed": BEATRICE_DIR.exists() and (BEATRICE_DIR / "README.md").exists(),
+        "beatrice_installed": not problems,
+        "beatrice_problems": problems,
         "data_dir": str(DATA_DIR),
         "output_dir": str(OUTPUT_DIR),
     }
 
 
-# --- Auto-Config for Mac ---
+# --- Auto-Config ---
 @app.get("/api/train/auto-config")
-async def get_auto_config():
-    """Return Mac-optimized training configuration based on hardware."""
-    hw = get_mac_hardware_info()
+def get_auto_config():
+    """Recommended training configuration for this hardware."""
+    hw = get_hardware_info()
 
-    # Count audio files across all speakers
     total_files = 0
     if DATA_DIR.exists():
         for speaker_dir in DATA_DIR.iterdir():
@@ -353,7 +607,7 @@ async def get_auto_config():
 
     config = get_optimal_training_config(hw, total_files)
     config["hardware"] = {
-        "chip": hw.get("gpu_name", hw.get("processor", "Unknown")),
+        "chip": hw.get("gpu_name") or hw.get("processor") or "Unknown",
         "ram_gb": hw["ram_total_gb"],
         "compute": hw["compute_backend"],
         "mps": hw["mps_available"],
@@ -363,7 +617,7 @@ async def get_auto_config():
 
 # --- Memory Monitor ---
 @app.get("/api/system/memory")
-async def get_memory():
+def get_memory():
     """Real-time memory usage for training monitoring."""
     mem = {}
     try:
@@ -374,61 +628,34 @@ async def get_memory():
         mem["ram_available_gb"] = round(vm.available / (1024**3), 2)
         mem["ram_percent"] = vm.percent
     except ImportError:
-        try:
-            result = subprocess.run(
-                ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True
-            )
-            if result.returncode == 0:
-                total = int(result.stdout.strip())
-                mem["ram_total_gb"] = round(total / (1024**3), 2)
-            # vm_stat for used memory
-            result = subprocess.run(["vm_stat"], capture_output=True, text=True)
-            if result.returncode == 0:
-                lines = result.stdout.split("\n")
-                page_size = 16384  # default on Apple Silicon
-                free = 0
-                for line in lines:
-                    if "page size" in line.lower():
-                        page_size = int(''.join(filter(str.isdigit, line)))
-                    if "Pages free" in line:
-                        free = int(''.join(filter(str.isdigit, line))) * page_size
-                mem["ram_available_gb"] = round(free / (1024**3), 2)
-                mem["ram_used_gb"] = round(mem.get("ram_total_gb", 8) - mem["ram_available_gb"], 2)
-                mem["ram_percent"] = round(mem["ram_used_gb"] / mem.get("ram_total_gb", 8) * 100, 1)
-        except Exception:
-            pass
-
-    # MPS memory (if available)
-    try:
-        import torch
-        if torch.backends.mps.is_available():
-            mem["mps_allocated_gb"] = round(torch.mps.current_allocated_memory() / (1024**3), 3)
-            mem["mps_driver_allocated_gb"] = round(torch.mps.driver_allocated_memory() / (1024**3), 3)
-    except Exception:
         pass
-
+    _get_memory_platform(mem)
     return mem
 
 
 # --- Dataset Management ---
 @app.get("/api/dataset/list")
-async def list_datasets():
+def list_datasets():
     """List all speaker datasets with audio stats."""
     speakers = []
     if DATA_DIR.exists():
         for speaker_dir in sorted(DATA_DIR.iterdir()):
-            if speaker_dir.is_dir():
+            if speaker_dir.is_dir() and not speaker_dir.name.startswith(("temp_hf_", "temp_kaggle_")):
                 wav_files = list(speaker_dir.glob("*.wav"))
                 total_size = sum(f.stat().st_size for f in wav_files)
 
-                # Try to compute duration
                 total_duration = None
                 try:
                     import wave
                     dur = 0
                     for wf in wav_files[:500]:  # limit for speed
-                        with wave.open(str(wf), 'r') as w:
-                            dur += w.getnframes() / w.getframerate()
+                        try:
+                            with wave.open(str(wf), 'r') as w:
+                                dur += w.getnframes() / w.getframerate()
+                        except Exception:
+                            # Non-PCM WAV (e.g. float) - fall back to soundfile if present
+                            import soundfile as sf
+                            dur += sf.info(str(wf)).duration
                     total_duration = round(dur, 1)
                 except Exception:
                     pass
@@ -443,236 +670,228 @@ async def list_datasets():
 
 
 @app.post("/api/dataset/create")
-async def create_speaker(data: dict):
+def create_speaker(data: dict):
     """Create a new speaker directory."""
-    speaker = data.get("speaker", "").strip()
-    if not speaker:
-        raise HTTPException(status_code=400, detail="Speaker name required")
-    speaker = "".join(c for c in speaker if c.isalnum() or c in "-_")
-    if not speaker:
-        raise HTTPException(status_code=400, detail="Invalid speaker name")
+    speaker = clean_speaker_name(data.get("speaker", ""))
     speaker_dir = DATA_DIR / speaker
     speaker_dir.mkdir(parents=True, exist_ok=True)
-    return {"message": f"Speaker folder '{speaker}' created", "path": str(speaker_dir)}
+    return {"message": f"Speaker folder '{speaker}' created", "speaker": speaker, "path": str(speaker_dir)}
+
+
+def _extract_wavs_from_zip(zip_path: Path, speaker_dir: Path) -> int:
+    """Copy every .wav inside a ZIP into speaker_dir (flattened; no paths kept)."""
+    count = 0
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for member in zf.infolist():
+            name = member.filename
+            if member.is_dir() or "__macosx" in name.lower():
+                continue
+            base = safe_filename(name, "")
+            if not base or not base.lower().endswith(".wav"):
+                continue
+            with zf.open(member) as src, open(speaker_dir / base, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            count += 1
+    return count
+
+
+def _collect_audio_files(src_dir: Path, speaker_dir: Path, progress: Optional[dict] = None) -> int:
+    """Copy .wav files (and .wav files inside .zip archives) from src_dir into speaker_dir."""
+    all_files = [Path(root) / f for root, _, files in os.walk(str(src_dir)) for f in files]
+    if progress is not None:
+        progress["total_count"] = len(all_files)
+    count = 0
+    for idx, file_path in enumerate(all_files):
+        if progress is not None:
+            progress["status"] = f"Processing downloaded file {idx + 1}/{len(all_files)}..."
+        suffix = file_path.suffix.lower()
+        if suffix == ".wav":
+            shutil.copy(file_path, speaker_dir / safe_filename(file_path.name, f"audio_{idx}.wav"))
+            count += 1
+        elif suffix == ".zip":
+            try:
+                count += _extract_wavs_from_zip(file_path, speaker_dir)
+            except Exception as zip_err:
+                print(f"Error reading zip {file_path.name}: {zip_err}")
+        if progress is not None:
+            progress["extracted_count"] = count
+    return count
 
 
 @app.post("/api/dataset/upload")
 async def upload_file(file: UploadFile = File(...), speaker: str = Form(...)):
     """Upload a WAV or ZIP file to a speaker's dataset."""
-    speaker = speaker.strip()
-    if not speaker:
-        raise HTTPException(status_code=400, detail="Speaker name required")
-    speaker = "".join(c for c in speaker if c.isalnum() or c in "-_")
+    speaker = clean_speaker_name(speaker)
     speaker_dir = DATA_DIR / speaker
     speaker_dir.mkdir(parents=True, exist_ok=True)
-    
-    filename_lower = file.filename.lower()
-    
+
+    filename = safe_filename(file.filename, "")
+    filename_lower = filename.lower()
+
     if filename_lower.endswith(".wav"):
-        dest = speaker_dir / file.filename
+        dest = speaker_dir / filename
+        content = await file.read()
         with open(dest, "wb") as f:
-            content = await file.read()
             f.write(content)
-        return {"message": f"Uploaded {file.filename}", "path": str(dest)}
-        
+        return {"message": f"Uploaded {filename}", "path": str(dest)}
+
     elif filename_lower.endswith(".zip"):
-        # Save zip temporarily in speaker_dir
-        zip_path = speaker_dir / f"temp_upload_{int(time.time())}.zip"
+        zip_path = speaker_dir / f"temp_upload_{int(time.time() * 1000)}.zip"
         try:
+            content = await file.read()
             with open(zip_path, "wb") as f:
-                content = await file.read()
                 f.write(content)
-            
-            extracted_count = 0
-            with zipfile.ZipFile(zip_path, 'r') as zf:
-                for member in zf.namelist():
-                    # Skip directories and metadata/hidden files
-                    if member.endswith('/') or "mac_osx" in member.lower() or "__macosx" in member or os.path.basename(member).startswith('.'):
-                        continue
-                    if member.lower().endswith('.wav'):
-                        basename = os.path.basename(member)
-                        if basename:
-                            target_path = speaker_dir / basename
-                            with zf.open(member) as src, open(target_path, 'wb') as dst:
-                                dst.write(src.read())
-                            extracted_count += 1
-            
-            # Clean up zip
-            if zip_path.exists():
-                zip_path.unlink()
-                
-            if extracted_count == 0:
-                raise HTTPException(status_code=400, detail="ZIP file uploaded but no WAV files were found inside it")
-                
-            return {
-                "message": f"Successfully extracted {extracted_count} WAV files from ZIP",
-                "extracted_count": extracted_count
-            }
+            extracted_count = _extract_wavs_from_zip(zip_path, speaker_dir)
         except zipfile.BadZipFile:
-            if zip_path.exists():
-                zip_path.unlink()
             raise HTTPException(status_code=400, detail="Invalid ZIP file structure")
         except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to process ZIP file: {str(e)}")
+        finally:
             if zip_path.exists():
                 zip_path.unlink()
-            raise HTTPException(status_code=500, detail=f"Failed to process ZIP file: {str(e)}")
-            
-    else:
-        raise HTTPException(status_code=400, detail="Only WAV and ZIP files accepted")
+
+        if extracted_count == 0:
+            raise HTTPException(status_code=400, detail="ZIP file uploaded but no WAV files were found inside it")
+        return {
+            "message": f"Successfully extracted {extracted_count} WAV files from ZIP",
+            "extracted_count": extracted_count,
+        }
+
+    raise HTTPException(status_code=400, detail="Only WAV and ZIP files accepted")
+
+
+def _parse_hf_repo_id(value: str) -> str:
+    """Accept 'owner/name' or any huggingface.co URL and return 'owner/name'."""
+    value = value.strip()
+    for marker in ("huggingface.co/datasets/", "huggingface.co/"):
+        if marker in value:
+            value = value.split(marker, 1)[1]
+            break
+    value = value.split("?")[0].split("#")[0].strip("/")
+    parts = [p for p in value.split("/") if p]
+    if len(parts) >= 2:
+        return f"{parts[0]}/{parts[1]}"
+    return value
+
+
+def _import_hf_with_datasets(repo_id: str, speaker_dir: Path) -> Optional[int]:
+    """
+    Import an audio dataset via the `datasets` library.
+    Returns the number of WAVs written, or None if this is not a loadable audio dataset.
+    Audio is read as raw bytes (no torchcodec needed) and re-encoded to 16-bit WAV.
+    """
+    try:
+        import datasets
+    except ImportError:
+        try:
+            hf_import_state["status"] = "Installing datasets library..."
+            subprocess.run([sys.executable, "-m", "pip", "install", "datasets"], check=True)
+            import datasets
+        except Exception as e:
+            print(f"Failed to auto-install datasets library: {e}")
+            return None
+    import soundfile as sf
+
+    hf_import_state["status"] = "Loading HF dataset via datasets library..."
+    print(f"Loading HF dataset via datasets library: {repo_id}...")
+    ds = datasets.load_dataset(repo_id)
+    if isinstance(ds, datasets.Dataset):
+        ds = {"train": ds}
+    if not ds:
+        return None
+    first_split = next(iter(ds.values()))
+    audio_col = next(
+        (name for name, feature in first_split.features.items() if isinstance(feature, datasets.Audio)),
+        None,
+    )
+    if audio_col is None:
+        return None
+
+    total_rows = sum(len(split) for split in ds.values())
+    hf_import_state["total_count"] = total_rows
+    written = 0
+    failed = 0
+    done = 0
+    for split_name, split in ds.items():
+        split = split.cast_column(audio_col, datasets.Audio(decode=False))
+        for i, row in enumerate(split):
+            done += 1
+            hf_import_state["status"] = f"Decoding & saving audio files ({done}/{total_rows})..."
+            audio = row.get(audio_col) or {}
+            raw = audio.get("bytes")
+            src_path = audio.get("path") or ""
+            if not raw and src_path and os.path.isfile(src_path):
+                with open(src_path, "rb") as f:
+                    raw = f.read()
+            if not raw:
+                failed += 1
+                continue
+            stem = Path(safe_filename(src_path, "")).stem or f"audio_{split_name}_{i}"
+            target = speaker_dir / f"{stem}.wav"
+            if target.exists():
+                target = speaker_dir / f"{stem}_{split_name}_{i}.wav"
+            try:
+                data, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=False)
+                sf.write(str(target), data, sr, subtype="PCM_16")
+                written += 1
+                hf_import_state["extracted_count"] = written
+            except Exception as e:
+                failed += 1
+                print(f"[HF] Could not decode {src_path or f'row {i}'}: {e}")
+    if failed:
+        print(f"[HF] {failed} row(s) could not be decoded and were skipped.")
+    return written
 
 
 @app.post("/api/dataset/import-hf")
-async def import_hf_dataset(data: dict):
+def import_hf_dataset(data: dict):
     """Fetch and download a dataset from Hugging Face."""
-    global hf_import_state
-    
-    repo_id = data.get("repo_id", "").strip()
-    speaker = data.get("speaker", "").strip()
-    
+    repo_id = str(data.get("repo_id", "")).strip()
     if not repo_id:
         raise HTTPException(status_code=400, detail="Hugging Face repository ID or URL is required")
-    if not speaker:
+    if not str(data.get("speaker", "")).strip():
         raise HTTPException(status_code=400, detail="Speaker name is required")
-        
-    # Clean speaker name
-    speaker = "".join(c for c in speaker if c.isalnum() or c in "-_")
-    if not speaker:
-        raise HTTPException(status_code=400, detail="Invalid speaker name")
-        
-    # Extract repo_id if a full HF URL is pasted
-    if "huggingface.co/datasets/" in repo_id:
-        repo_id = repo_id.split("huggingface.co/datasets/")[-1].split("?")[0].split("#")[0].strip("/")
-    elif "huggingface.co/" in repo_id:
-        repo_id = repo_id.split("huggingface.co/")[-1].split("?")[0].split("#")[0].strip("/")
-        
+    speaker = clean_speaker_name(data.get("speaker"))
+    repo_id = _parse_hf_repo_id(repo_id)
+    if "/" not in repo_id:
+        raise HTTPException(status_code=400, detail="Use the form 'owner/dataset-name' or paste the dataset URL")
+    if hf_import_state["active"]:
+        raise HTTPException(status_code=409, detail="Another import is already running")
+
     speaker_dir = DATA_DIR / speaker
     speaker_dir.mkdir(parents=True, exist_ok=True)
-    
+
     hf_import_state.update({
         "active": True,
         "status": "Initializing import...",
         "extracted_count": 0,
-        "total_count": 0
+        "total_count": 0,
     })
-    
+
     try:
-        # Try importing datasets
-        extracted_count = 0
-        datasets_success = False
+        # 1. `datasets` library (parquet / audiofolder datasets)
         try:
-            import datasets
-        except ImportError:
-            try:
-                hf_import_state["status"] = "Installing datasets library..."
-                # Install datasets library on the fly
-                subprocess.run([sys.executable, "-m", "pip", "install", "datasets"], check=True)
-                import datasets
-            except Exception as e:
-                print(f"Failed to auto-install datasets library: {e}")
-                datasets = None
+            count = _import_hf_with_datasets(repo_id, speaker_dir)
+            if count:
+                return {
+                    "message": f"Successfully imported {count} WAV files from Hugging Face dataset '{repo_id}'",
+                    "extracted_count": count,
+                    "speaker": speaker,
+                }
+        except Exception as ds_err:
+            print(f"datasets library load failed: {ds_err}. Falling back to snapshot_download...")
 
-        if datasets:
-            try:
-                # Load dataset via Hugging Face datasets library
-                hf_import_state["status"] = "Loading HF dataset via datasets library..."
-                print(f"Loading HF dataset via datasets library: {repo_id}...")
-                ds = datasets.load_dataset(repo_id)
-                
-                # Check if there is an Audio column in features
-                first_split = list(ds.keys())[0]
-                audio_col = None
-                for col_name, feature in ds[first_split].features.items():
-                    if isinstance(feature, datasets.Audio):
-                        audio_col = col_name
-                        break
-                        
-                if audio_col:
-                    try:
-                        # Try direct decoding and saving as WAV via torchaudio (handles Parquet formats correctly)
-                        print(f"[HF] Attempting to decode and save WAV files using datasets...")
-                        import torch
-                        import torchaudio
-                        
-                        total_rows = sum(len(ds[split]) for split in ds.keys())
-                        hf_import_state["total_count"] = total_rows
-                        
-                        for split in ds.keys():
-                            for i, row in enumerate(ds[split]):
-                                hf_import_state["status"] = f"Decoding & saving audio files ({extracted_count + 1}/{total_rows})..."
-                                audio_data = row[audio_col]
-                                if audio_data and audio_data.get('array') is not None:
-                                    sampling_rate = audio_data.get('sampling_rate', 16000)
-                                    array = audio_data.get('array')
-                                    audio_tensor = torch.from_numpy(array).float()
-                                    if audio_tensor.ndim == 1:
-                                        audio_tensor = audio_tensor.unsqueeze(0)
-                                    elif audio_tensor.ndim == 2:
-                                        if audio_tensor.shape[0] > 2 and audio_tensor.shape[1] <= 2:
-                                            audio_tensor = audio_tensor.T
-                                    filename = f"audio_{split}_{i}.wav"
-                                    target_path = speaker_dir / filename
-                                    torchaudio.save(target_path, audio_tensor, sampling_rate)
-                                    extracted_count += 1
-                                    hf_import_state["extracted_count"] = extracted_count
-                        
-                        datasets_success = True
-                    except Exception as decode_err:
-                        print(f"[HF] Direct decoding failed ({decode_err}), falling back to raw bytes cast...", flush=True)
-                        extracted_count = 0
-                        # Fallback: Cast to struct of bytes and write raw bytes
-                        new_features = ds[first_split].features.copy()
-                        new_features[audio_col] = datasets.Features({
-                            'bytes': datasets.Value('binary'),
-                            'path': datasets.Value('string')
-                        })
-                        total_rows = sum(len(ds[split]) for split in ds.keys())
-                        hf_import_state["total_count"] = total_rows
-                        
-                        for split in ds.keys():
-                            split_ds = ds[split].cast(new_features)
-                            for i, row in enumerate(split_ds):
-                                hf_import_state["status"] = f"Extracting audio files ({extracted_count + 1}/{total_rows})..."
-                                audio_data = row[audio_col]
-                                if audio_data and audio_data.get('bytes'):
-                                    filename = audio_data.get('path')
-                                    if filename:
-                                        filename = os.path.basename(filename)
-                                    if not filename or not filename.lower().endswith('.wav'):
-                                        filename = f"audio_{split}_{i}.wav"
-                                    target_path = speaker_dir / filename
-                                    with open(target_path, "wb") as f:
-                                        f.write(audio_data['bytes'])
-                                    extracted_count += 1
-                                    hf_import_state["extracted_count"] = extracted_count
-                        
-                        datasets_success = True
-                    
-                    if datasets_success:
-                        return {
-                            "message": f"Successfully imported {extracted_count} WAV files from Hugging Face dataset '{repo_id}'",
-                            "extracted_count": extracted_count,
-                            "speaker": speaker
-                        }
-            except Exception as ds_err:
-                print(f"datasets library load failed: {ds_err}. Falling back to snapshot_download...")
-
-        # FALLBACK: Use snapshot_download (in case it is a repository of raw WAV or ZIP files)
+        # 2. FALLBACK: raw repository snapshot (WAV or ZIP files)
         try:
             from huggingface_hub import snapshot_download
         except ImportError:
-            try:
-                hf_import_state["status"] = "Installing huggingface_hub library..."
-                subprocess.run([sys.executable, "-m", "pip", "install", "huggingface_hub"], check=True)
-                from huggingface_hub import snapshot_download
-            except Exception as e:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"huggingface_hub library is not installed and failed to auto-install: {str(e)}"
-                )
+            raise HTTPException(
+                status_code=500,
+                detail="huggingface_hub is not installed. Run: pip install -r requirements.txt",
+            )
 
         temp_dir = DATA_DIR / f"temp_hf_{int(time.time())}"
         temp_dir.mkdir(parents=True, exist_ok=True)
-        
         try:
             hf_import_state["status"] = "Downloading repository snapshot..."
             print(f"Downloading HF dataset snapshot for {repo_id}...")
@@ -680,827 +899,667 @@ async def import_hf_dataset(data: dict):
                 repo_id=repo_id,
                 repo_type="dataset",
                 local_dir=str(temp_dir),
-                ignore_patterns=["*.git*", "*.md", "*.py", "*.json", "*.txt"]
+                allow_patterns=["*.wav", "*.WAV", "*.zip", "*.ZIP"],
             )
-            
-            def process_file(file_path: Path):
-                nonlocal extracted_count
-                if file_path.suffix.lower() == ".wav":
-                    target = speaker_dir / file_path.name
-                    shutil.copy(file_path, target)
-                    extracted_count += 1
-                elif file_path.suffix.lower() == ".zip":
-                    try:
-                        with zipfile.ZipFile(file_path, 'r') as zf:
-                            for member in zf.namelist():
-                                if member.endswith('/') or "mac_osx" in member.lower() or "__macosx" in member or os.path.basename(member).startswith('.'):
-                                    continue
-                                if member.lower().endswith('.wav'):
-                                    basename = os.path.basename(member)
-                                    if basename:
-                                        target_path = speaker_dir / basename
-                                        with zf.open(member) as src, open(target_path, 'wb') as dst:
-                                            dst.write(src.read())
-                                        extracted_count += 1
-                    except Exception as zip_err:
-                        print(f"Error reading zip {file_path.name}: {zip_err}")
-            
-            all_filepaths = []
-            for root, dirs, files in os.walk(str(temp_dir)):
-                for file in files:
-                    all_filepaths.append(Path(root) / file)
-            
-            total_files = len(all_filepaths)
-            hf_import_state["total_count"] = total_files
-            
-            for idx, file_path in enumerate(all_filepaths):
-                hf_import_state["status"] = f"Processing downloaded file {idx + 1}/{total_files}..."
-                process_file(file_path)
-                hf_import_state["extracted_count"] = extracted_count
-                
-            shutil.rmtree(temp_dir)
-            
-            if extracted_count == 0:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Hugging Face dataset '{repo_id}' downloaded, but no WAV files were found or extracted"
-                )
-                
-            return {
-                "message": f"Successfully imported {extracted_count} WAV files from Hugging Face dataset '{repo_id}'",
-                "extracted_count": extracted_count,
-                "speaker": speaker
-            }
-            
+            extracted_count = _collect_audio_files(temp_dir, speaker_dir, hf_import_state)
+        except HTTPException:
+            raise
         except Exception as e:
-            if temp_dir.exists():
-                shutil.rmtree(temp_dir)
             raise HTTPException(status_code=500, detail=f"Failed to import dataset: {str(e)}")
-            
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+        if extracted_count == 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Hugging Face dataset '{repo_id}' downloaded, but no WAV files were found or extracted",
+            )
+        return {
+            "message": f"Successfully imported {extracted_count} WAV files from Hugging Face dataset '{repo_id}'",
+            "extracted_count": extracted_count,
+            "speaker": speaker,
+        }
     finally:
         hf_import_state["active"] = False
 
 
 @app.get("/api/dataset/kaggle-config")
-async def get_kaggle_config():
+def get_kaggle_config():
     """Check if Kaggle credentials are configured in ~/.kaggle/kaggle.json."""
-    kaggle_dir = Path.home() / ".kaggle"
-    config_file = kaggle_dir / "kaggle.json"
+    config_file = Path.home() / ".kaggle" / "kaggle.json"
     if config_file.exists():
         try:
-            with open(config_file, "r") as f:
+            with open(config_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            username = data.get("username", "")
             return {
-                "username": username,
+                "username": data.get("username", ""),
                 "key_configured": bool(data.get("key")),
-                "configured": True
+                "configured": True,
             }
         except Exception as e:
             print(f"Error reading kaggle.json: {e}")
-    return {
-        "username": "",
-        "key_configured": False,
-        "configured": False
-    }
+    return {"username": "", "key_configured": False, "configured": False}
 
 
 @app.post("/api/dataset/import-kaggle")
-async def import_kaggle_dataset(data: dict):
+def import_kaggle_dataset(data: dict):
     """Fetch and download a dataset from Kaggle."""
-    global hf_import_state
-    
-    dataset_ref = data.get("dataset_ref", "").strip()
-    username = data.get("username", "").strip()
-    key = data.get("key", "").strip()
-    speaker = data.get("speaker", "").strip()
-    
+    dataset_ref = str(data.get("dataset_ref", "")).strip()
+    username = str(data.get("username", "")).strip()
+    key = str(data.get("key", "")).strip()
+
     if not dataset_ref:
         raise HTTPException(status_code=400, detail="Kaggle dataset reference or URL is required")
-    if not speaker:
+    if not str(data.get("speaker", "")).strip():
         raise HTTPException(status_code=400, detail="Speaker name is required")
-        
-    # Clean speaker name
-    speaker = "".join(c for c in speaker if c.isalnum() or c in "-_")
-    if not speaker:
-        raise HTTPException(status_code=400, detail="Invalid speaker name")
-        
-    # Extract dataset_ref if a full Kaggle URL is pasted
-    if "kaggle.com/datasets/" in dataset_ref:
-        dataset_ref = dataset_ref.split("kaggle.com/datasets/")[-1].split("?")[0].split("#")[0].strip("/")
-        parts = dataset_ref.split("/")
-        if len(parts) >= 2:
-            dataset_ref = f"{parts[0]}/{parts[1]}"
-    elif "kaggle.com/" in dataset_ref:
-        dataset_ref = dataset_ref.split("kaggle.com/")[-1].split("?")[0].split("#")[0].strip("/")
-        parts = dataset_ref.split("/")
-        if len(parts) >= 2:
-            dataset_ref = f"{parts[0]}/{parts[1]}"
-            
+    speaker = clean_speaker_name(data.get("speaker"))
+    if hf_import_state["active"]:
+        raise HTTPException(status_code=409, detail="Another import is already running")
+
+    # Extract owner/dataset if a full Kaggle URL is pasted
+    for marker in ("kaggle.com/datasets/", "kaggle.com/"):
+        if marker in dataset_ref:
+            dataset_ref = dataset_ref.split(marker, 1)[1]
+            break
+    dataset_ref = dataset_ref.split("?")[0].split("#")[0].strip("/")
+    parts = [p for p in dataset_ref.split("/") if p]
+    if len(parts) >= 2:
+        dataset_ref = f"{parts[0]}/{parts[1]}"
+
     speaker_dir = DATA_DIR / speaker
     speaker_dir.mkdir(parents=True, exist_ok=True)
-    
+
     hf_import_state.update({
         "active": True,
         "status": "Initializing Kaggle import...",
         "extracted_count": 0,
-        "total_count": 0
+        "total_count": 0,
     })
-    
+
     try:
-        # Check if we should write credentials to ~/.kaggle/kaggle.json
         if username and key and key != "••••••••••••••••":
             kaggle_dir = Path.home() / ".kaggle"
             kaggle_dir.mkdir(parents=True, exist_ok=True)
             config_file = kaggle_dir / "kaggle.json"
-            
-            with open(config_file, "w") as f:
+            with open(config_file, "w", encoding="utf-8") as f:
                 json.dump({"username": username, "key": key}, f)
-            # Set permissions to 600 (required by Kaggle package)
-            config_file.chmod(0o600)
+            config_file.chmod(0o600)  # required by the Kaggle package
             print(f"Saved Kaggle credentials to {config_file}")
-            
-            # Set environment variables dynamically for current process
             os.environ["KAGGLE_USERNAME"] = username
             os.environ["KAGGLE_KEY"] = key
-        else:
-            # Try to read existing credentials if environment variables aren't already set
-            if not os.environ.get("KAGGLE_USERNAME") or not os.environ.get("KAGGLE_KEY"):
-                kaggle_dir = Path.home() / ".kaggle"
-                config_file = kaggle_dir / "kaggle.json"
-                if config_file.exists():
-                    try:
-                        with open(config_file, "r") as f:
-                            creds = json.load(f)
-                        os.environ["KAGGLE_USERNAME"] = creds.get("username", "")
-                        os.environ["KAGGLE_KEY"] = creds.get("key", "")
-                    except Exception as e:
-                        print(f"Failed to load existing Kaggle config: {e}")
-                        
-        # Ensure we have credentials before running
+        elif not os.environ.get("KAGGLE_USERNAME") or not os.environ.get("KAGGLE_KEY"):
+            config_file = Path.home() / ".kaggle" / "kaggle.json"
+            if config_file.exists():
+                try:
+                    with open(config_file, "r", encoding="utf-8") as f:
+                        creds = json.load(f)
+                    os.environ["KAGGLE_USERNAME"] = creds.get("username", "")
+                    os.environ["KAGGLE_KEY"] = creds.get("key", "")
+                except Exception as e:
+                    print(f"Failed to load existing Kaggle config: {e}")
+
         if not os.environ.get("KAGGLE_USERNAME") or not os.environ.get("KAGGLE_KEY"):
             raise HTTPException(
                 status_code=400,
-                detail="Kaggle credentials not found. Please provide Username and API Key."
+                detail="Kaggle credentials not found. Please provide Username and API Key.",
             )
-            
-        # Try importing kaggle
+
         try:
             import kaggle
         except ImportError:
             hf_import_state["status"] = "Installing kaggle library..."
             subprocess.run([sys.executable, "-m", "pip", "install", "kaggle"], check=True)
             import kaggle
-            
+
         temp_dir = DATA_DIR / f"temp_kaggle_{int(time.time())}"
         temp_dir.mkdir(parents=True, exist_ok=True)
-        
         try:
             hf_import_state["status"] = f"Downloading Kaggle dataset {dataset_ref}..."
             print(f"Downloading Kaggle dataset {dataset_ref} to {temp_dir}...")
-            
-            # Download and extract using official API
             kaggle.api.authenticate()
             kaggle.api.dataset_download_files(dataset_ref, path=str(temp_dir), unzip=True)
-            
-            extracted_count = 0
-            
-            def process_file(file_path: Path):
-                nonlocal extracted_count
-                if file_path.suffix.lower() == ".wav":
-                    target = speaker_dir / file_path.name
-                    shutil.copy(file_path, target)
-                    extracted_count += 1
-                elif file_path.suffix.lower() == ".zip":
-                    try:
-                        with zipfile.ZipFile(file_path, 'r') as zf:
-                            for member in zf.namelist():
-                                if member.endswith('/') or "mac_osx" in member.lower() or "__macosx" in member or os.path.basename(member).startswith('.'):
-                                    continue
-                                if member.lower().endswith('.wav'):
-                                    basename = os.path.basename(member)
-                                    if basename:
-                                        target_path = speaker_dir / basename
-                                        with zf.open(member) as src, open(target_path, 'wb') as dst:
-                                            dst.write(src.read())
-                                        extracted_count += 1
-                    except Exception as zip_err:
-                        print(f"Error reading zip {file_path.name}: {zip_err}")
-            
-            all_filepaths = []
-            for root, dirs, files in os.walk(str(temp_dir)):
-                for file in files:
-                    all_filepaths.append(Path(root) / file)
-            
-            total_files = len(all_filepaths)
-            hf_import_state["total_count"] = total_files
-            
-            for idx, file_path in enumerate(all_filepaths):
-                hf_import_state["status"] = f"Processing downloaded file {idx + 1}/{total_files}..."
-                process_file(file_path)
-                hf_import_state["extracted_count"] = extracted_count
-                
-            shutil.rmtree(temp_dir)
-            
-            if extracted_count == 0:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Kaggle dataset '{dataset_ref}' downloaded, but no WAV files were found or extracted"
-                )
-                
-            return {
-                "message": f"Successfully imported {extracted_count} WAV files from Kaggle dataset '{dataset_ref}'",
-                "extracted_count": extracted_count,
-                "speaker": speaker
-            }
-            
+            extracted_count = _collect_audio_files(temp_dir, speaker_dir, hf_import_state)
+        except HTTPException:
+            raise
         except Exception as e:
-            if temp_dir.exists():
-                shutil.rmtree(temp_dir)
             raise HTTPException(status_code=500, detail=f"Failed to import dataset: {str(e)}")
-            
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+        if extracted_count == 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Kaggle dataset '{dataset_ref}' downloaded, but no WAV files were found or extracted",
+            )
+        return {
+            "message": f"Successfully imported {extracted_count} WAV files from Kaggle dataset '{dataset_ref}'",
+            "extracted_count": extracted_count,
+            "speaker": speaker,
+        }
     finally:
         hf_import_state["active"] = False
 
 
 @app.get("/api/dataset/import-progress")
-async def get_import_progress():
+def get_import_progress():
     """Get status of Hugging Face or Kaggle dataset import progress."""
     return hf_import_state
 
 
 @app.delete("/api/dataset/{speaker}")
-async def delete_speaker(speaker: str):
+def delete_speaker(speaker: str):
     """Delete a speaker's dataset."""
-    speaker_dir = DATA_DIR / speaker
-    if not speaker_dir.exists():
+    name = clean_speaker_name(speaker)
+    if name != speaker:
+        raise HTTPException(status_code=400, detail="Invalid speaker name")
+    if training_state.get("speaker") == name:
+        _require_not_training("delete this speaker")
+    speaker_dir = DATA_DIR / name
+    if not speaker_dir.is_dir() or speaker_dir.parent != DATA_DIR:
         raise HTTPException(status_code=404, detail="Speaker not found")
     shutil.rmtree(speaker_dir)
-    return {"message": f"Deleted speaker '{speaker}'"}
+    return {"message": f"Deleted speaker '{name}'"}
+
+
+def _remove_file(path: str):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 @app.get("/api/dataset/export")
-async def export_dataset():
+def export_dataset():
     """Export all datasets as a ZIP file."""
     if not DATA_DIR.exists() or not any(DATA_DIR.iterdir()):
         raise HTTPException(status_code=404, detail="No datasets to export")
-    zip_path = BASE_DIR / "beatrice_dataset.zip"
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+    fd, zip_path = tempfile.mkstemp(prefix="beatrice_dataset_", suffix=".zip")
+    os.close(fd)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for root, dirs, files in os.walk(DATA_DIR):
             for file in files:
                 file_path = Path(root) / file
-                arcname = file_path.relative_to(DATA_DIR)
-                zf.write(file_path, arcname)
+                zf.write(file_path, file_path.relative_to(DATA_DIR))
+    tasks = BackgroundTasks()
+    tasks.add_task(_remove_file, zip_path)
     return FileResponse(
-        path=str(zip_path), filename="beatrice_dataset.zip",
-        media_type="application/zip",
+        path=zip_path, filename="beatrice_dataset.zip",
+        media_type="application/zip", background=tasks,
     )
 
 
-# --- Training (Mac-optimized) ---
-@app.post("/api/train/start")
-async def start_training(data: dict):
-    """Start Mac-optimized Beatrice training with MPS/CPU auto-config."""
-    global training_process, training_state
+# --- Training ---
 
-    if training_state["active"]:
-        raise HTTPException(status_code=409, detail="Training already in progress")
-
-    speaker = data.get("speaker", "")
-    steps = data.get("steps", 10000)
-    batch_size = data.get("batch_size", 4)
-    learning_rate = data.get("learning_rate", "1e-4")
-    grad_accum = data.get("gradient_accumulation_steps", 1)
-    use_mixed_precision = data.get("mixed_precision", False)
-    use_compile = data.get("compile_model", False)
-    num_workers = data.get("num_workers", 0)
-
-    speaker_dir = DATA_DIR / speaker
-    if not speaker_dir.exists() or not list(speaker_dir.glob("*.wav")):
-        raise HTTPException(status_code=400, detail=f"No WAV files found for speaker '{speaker}'")
-
-    if not BEATRICE_DIR.exists():
-        raise HTTPException(status_code=400, detail="Beatrice trainer not installed. Run setup first.")
-
-    # Build the Mac-optimized training script
-    log_file = BASE_DIR / "training.log"
-
-    # The training script runs as a subprocess and writes progress to a JSON log
-    training_script = f'''
-import sys, os, time, json, random, gc, traceback, shutil
-
-# ===== Mac-Optimized Training Script =====
-LOG_FILE = "{str(log_file)}"
-BEATRICE_DIR = "{str(BEATRICE_DIR)}"
-DATA_DIR = "{str(DATA_DIR)}"
-OUTPUT_DIR = "{str(OUTPUT_DIR)}"
-SPEAKER = "{speaker}"
-TOTAL_STEPS = {steps}
-BATCH_SIZE = {batch_size}
-LEARNING_RATE = float("{learning_rate}")
-GRAD_ACCUM = {grad_accum}
-USE_MIXED_PRECISION = {use_mixed_precision}
-USE_COMPILE = {use_compile}
-NUM_WORKERS = {num_workers}
-
-def write_status(step, loss, active=True, completed=False, extra=None):
-    """Write training status to log file for the server to poll."""
-    status = {{
-        "active": active, "step": step, "total_steps": TOTAL_STEPS,
-        "loss": round(loss, 6) if loss is not None else None,
-        "completed": completed,
-        "memory_mb": None, "steps_per_sec": None,
-    }}
-    if extra:
-        status.update(extra)
+def _int_param(data: dict, key: str, default: int, lo: int, hi: int) -> int:
+    value = data.get(key, default)
+    if value is None or value == "":
+        value = default
     try:
-        # Get memory usage
-        try:
-            import psutil
-            status["memory_mb"] = round(psutil.Process().memory_info().rss / 1024 / 1024, 1)
-        except:
-            pass
-    except:
-        pass
-    with open(LOG_FILE, "w") as f:
-        json.dump(status, f)
+        if isinstance(value, bool):
+            raise ValueError
+        number = float(value)
+        if not number.is_integer():
+            raise ValueError
+        number = int(number)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"'{key}' must be a whole number")
+    if not lo <= number <= hi:
+        raise HTTPException(status_code=400, detail=f"'{key}' must be between {lo} and {hi}")
+    return number
 
-def try_beatrice_training():
-    """Attempt to run the actual Beatrice trainer with Mac device mapping."""
-    import importlib.util
-    
-    # Try importing/locating the module first to check if installed
+
+def _float_param(data: dict, key: str, default: float, lo: float, hi: float) -> float:
+    value = data.get(key, default)
+    if value is None or value == "":
+        value = default
     try:
-        spec = importlib.util.find_spec("beatrice_trainer")
-        if spec is None:
-            # Add to path and try again
-            sys.path.insert(0, BEATRICE_DIR)
-            spec = importlib.util.find_spec("beatrice_trainer")
-            if spec is None:
-                print("[MAC] beatrice_trainer package not found in Python path", flush=True)
-                return False
-    except Exception as e:
-        print(f"[MAC] Failed to find beatrice_trainer: {{e}}", flush=True)
-        return False
+        if isinstance(value, bool):
+            raise ValueError
+        number = float(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"'{key}' must be a number (e.g. 5e-5)")
+    if not math.isfinite(number) or not lo <= number <= hi:
+        raise HTTPException(status_code=400, detail=f"'{key}' must be between {lo:g} and {hi:g}")
+    return number
 
-    # ===== TRY ACTUAL BEATRICE TRAINER =====
-    try:
-        print("[MAC] Beatrice trainer package found, preparing real training...", flush=True)
 
-        # Write config file for real training
-        config_file = os.path.join(BEATRICE_DIR, "assets", f"config_{{SPEAKER}}.json")
-        os.makedirs(os.path.dirname(config_file), exist_ok=True)
+def _bool_param(data: dict, key: str, default: bool) -> bool:
+    value = data.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return default
 
-        # Read default hparams and overlay user parameters
-        h = {{}}
-        default_config_path = os.path.join(BEATRICE_DIR, "assets", "default_config.json")
-        if os.path.exists(default_config_path):
-            try:
-                with open(default_config_path, "r") as f:
-                    h = json.load(f)
-            except Exception as e:
-                print(f"[MAC] Error reading default config: {{e}}", flush=True)
 
-        # Force compile off on MPS — torch.compile's donated_buffer optimization
-        # conflicts with retain_graph=True in the discriminator backward pass
-        import torch
-        is_mps = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-        force_compile = False if is_mps else USE_COMPILE
-
-        h.update({{
-            "n_steps": TOTAL_STEPS,
-            "batch_size": BATCH_SIZE,
-            "learning_rate_g": LEARNING_RATE,
-            "learning_rate_d": LEARNING_RATE,
-            "num_workers": NUM_WORKERS,
-            "use_amp": USE_MIXED_PRECISION,
-            "compile_convnext": force_compile,
-            "compile_d4c": force_compile,
-            "compile_discriminator": force_compile,
-        }})
-
-        with open(config_file, "w") as f:
-            json.dump(h, f, indent=4)
-
-        # Disable donated buffer optimization as safety net for any compiled ops
-        try:
-            import torch._functorch.config
-            torch._functorch.config.donated_buffer = False
-        except Exception:
-            pass
-
-        # Prepare isolated data directory (speaker isolation)
-        data_active_dir = os.path.join(BEATRICE_DIR, "data_active")
-        if os.path.exists(data_active_dir):
-            try:
-                shutil.rmtree(data_active_dir)
-            except Exception as e:
-                print(f"[MAC] Warning: could not rmtree data_active: {{e}}", flush=True)
-        os.makedirs(data_active_dir, exist_ok=True)
-        
-        src_speaker_dir = os.path.join(DATA_DIR, SPEAKER)
-        dst_speaker_dir = os.path.join(data_active_dir, SPEAKER)
-        try:
-            os.symlink(src_speaker_dir, dst_speaker_dir)
-            print(f"[MAC] Created symlink for speaker isolation: {{dst_speaker_dir}} -> {{src_speaker_dir}}", flush=True)
-        except Exception as e:
-            print(f"[MAC] Symlink failed ({{e}}), copying speaker directory instead...", flush=True)
-            try:
-                shutil.copytree(src_speaker_dir, dst_speaker_dir)
-            except Exception as copy_err:
-                print(f"[MAC] Copy failed: {{copy_err}}", flush=True)
-
-        # Clean up old training artifacts from speaker output dir so Beatrice
-        # trainer doesn't refuse to start (it errors if checkpoint_latest.pt.gz exists)
-        speaker_out_dir = os.path.join(OUTPUT_DIR, SPEAKER)
-        if os.path.isdir(speaker_out_dir):
-            print(f"[MAC] Cleaning old training artifacts from {{speaker_out_dir}}...", flush=True)
-            for item in os.listdir(speaker_out_dir):
-                item_path = os.path.join(speaker_out_dir, item)
-                try:
-                    if item.endswith(".pt.gz") or item.startswith("events.out.tfevents"):
-                        os.remove(item_path)
-                        print(f"[MAC]   Removed: {{item}}", flush=True)
-                    elif item.startswith("paraphernalia_") and os.path.isdir(item_path):
-                        shutil.rmtree(item_path)
-                        print(f"[MAC]   Removed dir: {{item}}", flush=True)
-                except Exception as cleanup_err:
-                    print(f"[MAC]   Warning: could not remove {{item}}: {{cleanup_err}}", flush=True)
-
-        # Set sys.argv and env variables
-        sys.argv = [
-            sys.executable,
-            "-d", data_active_dir,
-            "-o", os.path.join(OUTPUT_DIR, SPEAKER),
-            "-c", config_file
-        ]
-        
-        # Set status log file env variable so __main__.py knows where to write progress
-        os.environ["BEATRICE_STATUS_LOG_FILE"] = LOG_FILE
-        os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-        os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
-
-        # Execute beatrice_trainer.__main__
-        import runpy
-        print("[MAC] Launching training via runpy...", flush=True)
-        runpy.run_module("beatrice_trainer", run_name="__main__")
+def _is_link(path: Path) -> bool:
+    if path.is_symlink():
         return True
-
-    except Exception as e:
-        print(f"[MAC] Could not run Beatrice trainer: {{e}}", flush=True)
-        traceback.print_exc()
-        return False
+    isjunction = getattr(os.path, "isjunction", None)  # Python 3.12+
+    return bool(isjunction and isjunction(path))
 
 
-def run_simulated_training():
-    """Fallback: high-fidelity simulated training that mirrors real training behavior."""
-    import torch
-
-    # Device selection
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
-        device_name = "Apple MPS (Metal)"
-    else:
-        device = torch.device("cpu")
-        device_name = "CPU"
-
-    print(f"[MAC] Running on {{device_name}}", flush=True)
-    print(f"[MAC] Batch={{BATCH_SIZE}}, GradAccum={{GRAD_ACCUM}}, Steps={{TOTAL_STEPS}}", flush=True)
-    print(f"[MAC] Learning rate: {{LEARNING_RATE}}", flush=True)
-
-    # Set optimal threading for CPU ops
-    physical_cores = os.cpu_count() or 1
-    torch.set_num_threads(physical_cores)
-
-    # MPS environment
-    os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-    os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
-
-    # Simulate a realistic training loop with actual tensor ops on the target device
-    # This tests MPS/CPU performance and gives accurate time estimates
-    print("[MAC] Initializing model simulation on device...", flush=True)
-
+def _unlink_link(path: Path):
     try:
-        # Create a small model to exercise the device
-        model = torch.nn.Sequential(
-            torch.nn.Linear(256, 512),
-            torch.nn.ReLU(),
-            torch.nn.Linear(512, 512),
-            torch.nn.ReLU(),
-            torch.nn.Linear(512, 256),
-        ).to(device)
-
-        optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-        use_amp = USE_MIXED_PRECISION and device.type == "mps"
-
-        print(f"[MAC] Model on {{device}}, mixed_precision={{use_amp}}", flush=True)
-    except Exception as e:
-        print(f"[MAC] Device init failed: {{e}}, falling back to CPU", flush=True)
-        device = torch.device("cpu")
-        model = torch.nn.Sequential(
-            torch.nn.Linear(256, 512), torch.nn.ReLU(),
-            torch.nn.Linear(512, 256),
-        ).to(device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-        use_amp = False
-
-    write_status(0, None, active=True, extra={{"device": str(device)}})
-
-    loss_val = 2.5 + random.random() * 0.5
-    start_time = time.time()
-    step_times = []
-
-    for step in range(1, TOTAL_STEPS + 1):
-        step_start = time.time()
-
-        # Gradient accumulation loop
-        accumulated_loss = 0
-        for micro_step in range(GRAD_ACCUM):
-            # Forward pass with realistic-sized tensors
-            x = torch.randn(BATCH_SIZE, 256, device=device)
-            target = torch.randn(BATCH_SIZE, 256, device=device)
-
-            if use_amp:
-                with torch.autocast(device_type=device.type, dtype=torch.float16):
-                    pred = model(x)
-                    loss = torch.nn.functional.mse_loss(pred, target)
-            else:
-                pred = model(x)
-                loss = torch.nn.functional.mse_loss(pred, target)
-
-            loss = loss / GRAD_ACCUM
-            loss.backward()
-            accumulated_loss += loss.item()
-
-        # Optimizer step
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-
-        # Sync MPS to get accurate timing
-        if device.type == "mps":
-            torch.mps.synchronize()
-
-        step_time = time.time() - step_start
-        step_times.append(step_time)
-
-        # Smooth the loss for display
-        loss_val = 0.995 * loss_val + 0.005 * accumulated_loss + random.gauss(0, 0.002)
-        loss_val = max(0.01, loss_val)
-
-        # Log every N steps
-        if step % max(1, TOTAL_STEPS // 200) == 0 or step == 1:
-            elapsed = time.time() - start_time
-            recent_times = step_times[-50:]
-            avg_step_time = sum(recent_times) / len(recent_times)
-            steps_per_sec = 1.0 / avg_step_time if avg_step_time > 0 else 0
-            eta_sec = (TOTAL_STEPS - step) * avg_step_time
-
-            write_status(step, loss_val, active=True, extra={{
-                "device": str(device),
-                "steps_per_sec": round(steps_per_sec, 2),
-                "eta_seconds": round(eta_sec, 1),
-            }})
-            print(f"[Step {{step}}/{{TOTAL_STEPS}}] loss={{loss_val:.4f}} | "
-                  f"{{steps_per_sec:.1f}} steps/s | ETA {{eta_sec/60:.1f}}m", flush=True)
-
-        # Periodic MPS memory cleanup
-        if device.type == "mps" and step % 100 == 0:
-            torch.mps.empty_cache()
-            gc.collect()
-
-    # Save model
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    model_name = f"beatrice_{{SPEAKER}}_{{TOTAL_STEPS}}steps.pth"
-    model_path = os.path.join(OUTPUT_DIR, model_name)
-    torch.save(model.state_dict(), model_path)
-    print(f"[MAC] Model saved: {{model_path}}", flush=True)
-
-    # Final status
-    total_time = time.time() - start_time
-    write_status(TOTAL_STEPS, loss_val, active=False, completed=True, extra={{
-        "device": str(device),
-        "total_time_sec": round(total_time, 1),
-        "avg_steps_per_sec": round(TOTAL_STEPS / total_time, 2),
-    }})
-    print(f"[MAC] Training complete in {{total_time/60:.1f}} minutes", flush=True)
-
-    # Cleanup
-    del model, optimizer
-    if device.type == "mps":
-        torch.mps.empty_cache()
-    gc.collect()
+        os.unlink(path)
+    except OSError:
+        os.rmdir(path)  # Windows directory symlink / junction
 
 
-# ===== MAIN =====
-write_status(0, None, active=True, extra={{"phase": "initializing"}})
+def _clear_staging_dir():
+    """Remove the per-run dataset view without ever following links into DATA_DIR."""
+    if _is_link(STAGING_DIR):
+        _unlink_link(STAGING_DIR)
+        return
+    if not STAGING_DIR.exists():
+        return
+    for entry in STAGING_DIR.iterdir():
+        if _is_link(entry):
+            _unlink_link(entry)
+        elif entry.is_dir():
+            for inner in entry.iterdir():
+                if _is_link(inner):
+                    _unlink_link(inner)
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
 
-# Try real training first, fall back to simulated
-if not try_beatrice_training():
-    print("[MAC] Using device-benchmarking training mode...", flush=True)
-    run_simulated_training()
-'''
 
-    trainer_log_path = BASE_DIR / "trainer_stdout.log"
-    with open(trainer_log_path, "w") as f:
-        training_process = subprocess.Popen(
-            [sys.executable, "-u", "-c", training_script],
-            stdout=f,
+def _stage_speaker(speaker: str) -> Path:
+    """
+    Build data_active/<speaker>/<speaker> -> data/<speaker> so the trainer only
+    sees this speaker and names its checkpoints/paraphernalia after it.
+    """
+    _clear_staging_dir()
+    stage_root = STAGING_DIR / speaker
+    stage_root.mkdir(parents=True, exist_ok=True)
+    src = DATA_DIR / speaker
+    dst = stage_root / speaker
+    try:
+        os.symlink(src, dst, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        # Windows without Developer Mode cannot create symlinks: copy instead.
+        shutil.copytree(src, dst)
+    return stage_root
+
+
+def _prepare_output_dir(speaker: str) -> Path:
+    """
+    Each run writes to output/<speaker>/. An earlier run there is moved aside to
+    output/<speaker>-<timestamp>/ so previous models are never deleted (the
+    trainer refuses to start in a folder that already holds a checkpoint).
+    """
+    out_dir = OUTPUT_DIR / speaker
+    if out_dir.is_dir() and any(out_dir.iterdir()):
+        stamp = datetime.fromtimestamp(out_dir.stat().st_mtime).strftime("%Y%m%d-%H%M%S")
+        archived = OUTPUT_DIR / f"{speaker}-{stamp}"
+        n = 1
+        while archived.exists():
+            n += 1
+            archived = OUTPUT_DIR / f"{speaker}-{stamp}-{n}"
+        out_dir.rename(archived)
+        print(f"[train] Kept previous run of '{speaker}' in {archived}")
+    return out_dir
+
+
+def _start_trainer_process(job_file: Path) -> subprocess.Popen:
+    env = dict(os.environ)
+    env.update(trainer_env())
+    cpu_threads = str(os.cpu_count() or 1)
+    env.setdefault("OMP_NUM_THREADS", cpu_threads)
+    env.setdefault("MKL_NUM_THREADS", cpu_threads)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
+    log = open(TRAINER_STDOUT_LOG, "w", encoding="utf-8")
+    try:
+        log.write(f"[server] {datetime.now().isoformat(timespec='seconds')} starting beatrice_trainer\n")
+        log.flush()
+        return subprocess.Popen(
+            [sys.executable, "-u", str(TRAINER_RUNNER), str(job_file)],
+            stdout=log,
             stderr=subprocess.STDOUT,
             cwd=str(BEATRICE_DIR),
-            env={
-                **os.environ,
-                "PYTORCH_ENABLE_MPS_FALLBACK": "1",
-                "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.0",
-                "OMP_NUM_THREADS": str(os.cpu_count() or 1),
-                "MKL_NUM_THREADS": str(os.cpu_count() or 1),
-            },
+            env=env,
         )
-
-    training_state.update({
-        "active": True,
-        "speaker": speaker,
-        "step": 0,
-        "total_steps": steps,
-        "loss": None,
-        "start_time": time.time(),
-        "log_file": str(log_file),
-        "memory_usage": None,
-        "steps_per_sec": None,
-    })
-
-    return {"message": "Training started (Mac-optimized)", "pid": training_process.pid}
+    finally:
+        log.close()
 
 
-@app.get("/api/train/status")
-async def get_training_status():
-    """Get current training progress with Mac performance metrics."""
-    global training_state, training_process
+@app.post("/api/train/start")
+def start_training(data: dict):
+    """Start real Beatrice training for one speaker."""
+    global training_process, training_state
 
-    log_file = training_state.get("log_file")
-    if log_file and os.path.exists(log_file):
+    with training_lock:
+        if _training_running():
+            raise HTTPException(status_code=409, detail="Training already in progress")
+
+        if not str(data.get("speaker", "")).strip():
+            raise HTTPException(status_code=400, detail="Speaker name required")
+        speaker = clean_speaker_name(data.get("speaker"))
+        steps = _int_param(data, "steps", 10000, 1, 1_000_000)
+        batch_size = _int_param(data, "batch_size", 4, 1, 256)
+        learning_rate = _float_param(data, "learning_rate", 5e-5, 1e-8, 1.0)
+        num_workers = _int_param(data, "num_workers", 0, 0, 64)
+        use_amp = _bool_param(data, "mixed_precision", False)
+        use_compile = _bool_param(data, "compile_model", False)
+        # "gradient_accumulation_steps" is accepted for compatibility but
+        # beatrice_trainer has no gradient accumulation, so it is ignored.
+
+        speaker_dir = DATA_DIR / speaker
+        if not _audio_files(speaker_dir):
+            raise HTTPException(status_code=400, detail=f"No WAV files found for speaker '{speaker}'")
+
+        problems = trainer_setup_problems()
+        if problems:
+            raise HTTPException(
+                status_code=400,
+                detail="The Beatrice trainer is not ready: " + "; ".join(problems)
+                + ". Re-run the start script (it installs packages and downloads the weights) or use "
+                "'Download or update trainer' in Settings, then try again.",
+            )
+
+        notes = []
+        hw = get_hardware_info()
+        compile_ok = use_compile
+        if use_compile and hw.get("mps_available"):
+            compile_ok = False
+            notes.append("torch.compile disabled: it breaks the discriminator backward pass on Apple MPS.")
+        elif use_compile and importlib.util.find_spec("triton") is None:
+            compile_ok = False
+            notes.append("torch.compile disabled: it needs Triton, which is not installed.")
+        if num_workers > 0:
+            num_workers = 0
+            notes.append(
+                "num_workers set to 0: DataLoader worker processes cannot load the trainer's "
+                "dataset classes on macOS/Windows ('spawn' start method)."
+            )
+        if use_amp and hw.get("mps_available"):
+            notes.append("Mixed precision is on: on Apple GPUs it can produce NaN losses (steps are then skipped).")
+
+        # Training config = upstream defaults + the user's settings
+        h = _read_json(DEFAULT_CONFIG_FILE)
+        h.update({
+            "n_steps": steps,
+            "batch_size": batch_size,
+            "learning_rate_g": learning_rate,
+            "learning_rate_d": learning_rate,
+            "num_workers": num_workers,
+            "use_amp": use_amp,
+            "compile_convnext": compile_ok,
+            "compile_d4c": compile_ok,
+            "compile_discriminator": compile_ok,
+        })
+
+        WORK_DIR.mkdir(parents=True, exist_ok=True)
+        config_file = WORK_DIR / f"config_{speaker}.json"
+        with open(config_file, "w", encoding="utf-8") as f:
+            json.dump(h, f, indent=4)
+
         try:
-            with open(log_file, "r") as f:
-                data = json.load(f)
-            training_state["step"] = data.get("step", 0)
-            training_state["loss"] = data.get("loss")
-            training_state["active"] = data.get("active", False)
-            training_state["memory_usage"] = data.get("memory_mb")
-            training_state["steps_per_sec"] = data.get("steps_per_sec")
+            data_dir = _stage_speaker(speaker)
+            out_dir = _prepare_output_dir(speaker)
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"Could not prepare training folders: {e}")
 
-            if data.get("completed"):
-                training_state["active"] = False
-                if training_process:
-                    training_process = None
-        except (json.JSONDecodeError, FileNotFoundError):
-            pass
+        for stale in (STATUS_FILE, Path(str(STATUS_FILE) + ".tmp")):
+            if stale.exists():
+                stale.unlink()
 
-    if training_process and training_process.poll() is not None:
-        training_state["active"] = False
-        training_process = None
+        job = {
+            "speaker": speaker,
+            "beatrice_dir": str(BEATRICE_DIR),
+            "data_dir": str(data_dir),
+            "out_dir": str(out_dir),
+            "config_file": str(config_file),
+            "status_file": str(STATUS_FILE),
+            "total_steps": steps,
+            "notes": notes,
+        }
+        job_file = WORK_DIR / "job.json"
+        with open(job_file, "w", encoding="utf-8") as f:
+            json.dump(job, f, indent=2)
+
+        training_process = _start_trainer_process(job_file)
+
+        training_state = _idle_training_state()
+        training_state.update({
+            "active": True,
+            "state": "starting",
+            "phase": "starting",
+            "speaker": speaker,
+            "total_steps": steps,
+            "start_time": time.time(),
+            "output_dir": str(out_dir),
+            "pid": training_process.pid,
+            "notes": notes,
+        })
 
     return {
-        "active": training_state["active"],
-        "speaker": training_state["speaker"],
-        "step": training_state["step"],
-        "total_steps": training_state["total_steps"],
-        "loss": training_state["loss"],
-        "start_time": training_state["start_time"],
-        "memory_usage_mb": training_state.get("memory_usage"),
-        "steps_per_sec": training_state.get("steps_per_sec"),
+        "message": "Training started",
+        "pid": training_process.pid,
+        "speaker": speaker,
+        "total_steps": steps,
+        "output_dir": str(out_dir),
+        "notes": notes,
     }
 
 
-@app.post("/api/train/stop")
-async def stop_training():
-    """Stop current training and cleanup MPS memory."""
-    global training_process, training_state
-    if training_process:
-        try:
-            training_process.terminate()
-            training_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            training_process.kill()
-        training_process = None
-    training_state["active"] = False
+@app.get("/api/train/status")
+def get_training_status():
+    """Current training progress, as reported by the real trainer."""
+    global training_process
 
-    # Attempt MPS cache cleanup
+    st = training_state
+    data = _read_json(STATUS_FILE) if st["start_time"] else {}
+    if data and st["state"] != "stopped":
+        for key in ("step", "loss", "steps_per_sec", "eta_seconds", "device", "phase"):
+            if key in data:
+                st[key] = data[key]
+        if "memory_mb" in data:
+            st["memory_usage"] = data["memory_mb"]
+        if data.get("error"):
+            st["error"] = data["error"]
+
+    proc = training_process
+    if proc is not None:
+        rc = proc.poll()
+        if rc is None and not st["error"]:
+            st["active"] = True
+            st["state"] = "running" if st.get("phase") == "training" else "starting"
+        elif rc is not None:
+            training_process = None
+            st["active"] = False
+            st["exit_code"] = rc
+            st["end_time"] = time.time()
+            if st["state"] != "stopped":
+                if rc == 0 and data.get("completed") and not st["error"]:
+                    st["state"] = "completed"
+                    st["completed"] = True
+                    st["phase"] = "finished"
+                else:
+                    st["state"] = "failed"
+                    st["completed"] = False
+                    if not st["error"]:
+                        tail = _tail_lines(TRAINER_STDOUT_LOG, 15)
+                        st["error"] = (
+                            f"The training process exited unexpectedly (exit code {rc}) without "
+                            "reporting an error. Last lines of trainer_stdout.log:\n" + "\n".join(tail)
+                        )
+        else:
+            # The runner reported an error and is about to exit.
+            st["active"] = False
+            st["state"] = "failed"
+            st["completed"] = False
+    if st["error"] and st["state"] not in ("stopped",):
+        st["active"] = False
+        st["state"] = "failed"
+        st["completed"] = False
+
+    elapsed = None
+    if st["start_time"]:
+        elapsed = round((st["end_time"] or time.time()) - st["start_time"], 1)
+
+    return {
+        "active": st["active"],
+        "state": st["state"],
+        "completed": st["completed"],
+        "error": st["error"],
+        "exit_code": st["exit_code"],
+        "phase": st["phase"],
+        "speaker": st["speaker"],
+        "step": st["step"],
+        "total_steps": st["total_steps"],
+        "loss": st["loss"],
+        "start_time": st["start_time"],
+        "elapsed_seconds": elapsed,
+        "memory_usage_mb": st.get("memory_usage"),
+        "steps_per_sec": st.get("steps_per_sec"),
+        "eta_seconds": st.get("eta_seconds"),
+        "device": st.get("device"),
+        "output_dir": st.get("output_dir"),
+        "pid": st.get("pid"),
+        "notes": st.get("notes", []),
+    }
+
+
+def _kill_process_tree(proc: subprocess.Popen):
+    children = []
     try:
-        import torch
-        if hasattr(torch, 'mps') and hasattr(torch.mps, 'empty_cache'):
-            torch.mps.empty_cache()
-        gc.collect()
+        import psutil
+        children = psutil.Process(proc.pid).children(recursive=True)
     except Exception:
         pass
+    try:
+        proc.terminate()
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+    except OSError:
+        pass
+    for child in children:
+        try:
+            child.kill()
+        except Exception:
+            pass
 
-    return {"message": "Training stopped"}
+
+@app.post("/api/train/stop")
+def stop_training():
+    """Stop the current training run."""
+    global training_process
+    proc = training_process
+    was_running = proc is not None and proc.poll() is None
+    if proc is not None:
+        _kill_process_tree(proc)
+        training_process = None
+    if was_running:
+        training_state.update({
+            "active": False,
+            "state": "stopped",
+            "phase": "stopped",
+            "completed": False,
+            "error": None,
+            "end_time": time.time(),
+        })
+    else:
+        training_state["active"] = False
+
+    gc.collect()
+    return {"message": "Training stopped" if was_running else "No training was running"}
 
 
 @app.get("/api/train/console-logs")
-async def get_console_logs(lines: int = 100):
+def get_console_logs(lines: int = 100):
     """Retrieve the last N lines of the training stdout/stderr logs."""
-    log_path = BASE_DIR / "trainer_stdout.log"
-    if not log_path.exists():
+    if not TRAINER_STDOUT_LOG.exists():
         return {"logs": []}
     try:
-        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+        lines = max(1, min(int(lines), 2000))
+        with open(TRAINER_STDOUT_LOG, "r", encoding="utf-8", errors="replace") as f:
             content = f.readlines()
-            # Clean carriage returns from tqdm output
-            cleaned_content = []
-            for line in content[-lines:]:
-                # Tqdm writes carriage returns (\r) to overwrite lines.
-                # Let's get the last segment of carriage return in a line if present.
-                if "\r" in line:
-                    line = line.split("\r")[-1]
-                cleaned_content.append(line.strip())
-            return {"logs": cleaned_content}
+        cleaned_content = []
+        for line in content[-lines:]:
+            # tqdm overwrites its line with carriage returns: keep the last segment
+            if "\r" in line:
+                line = line.split("\r")[-1]
+            cleaned_content.append(line.strip())
+        return {"logs": cleaned_content}
     except Exception as e:
         return {"logs": [f"Error reading logs: {str(e)}"]}
 
 
 # --- Models ---
 @app.get("/api/models/list")
-async def list_models():
-    """List trained models recursively, including files and paraphernalia directories."""
+def list_models():
+    """List trained models: paraphernalia_* folders (what the voice changer loads) and model files."""
     models = []
     if OUTPUT_DIR.exists():
-        # Look for files and paraphernalia directories recursively
         for path in sorted(OUTPUT_DIR.rglob('*')):
-            # Skip if it is within a paraphernalia directory to avoid listing individual files
-            if "paraphernalia_" in path.parent.name:
+            # Skip files inside a paraphernalia directory
+            if any(part.startswith("paraphernalia_") for part in path.relative_to(OUTPUT_DIR).parts[:-1]):
                 continue
-            
+
             if path.is_file() and path.suffix in ('.bin', '.pth', '.pt', '.onnx', '.safetensors'):
                 models.append({
                     "name": path.name,
-                    "path": str(path.relative_to(OUTPUT_DIR)),
+                    "path": path.relative_to(OUTPUT_DIR).as_posix(),
                     "size": path.stat().st_size,
                     "created": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
                 })
             elif path.is_dir() and path.name.startswith("paraphernalia_"):
-                # Sum the size of all files inside the folder
                 dir_size = sum(f.stat().st_size for f in path.rglob('*') if f.is_file())
                 models.append({
                     "name": path.name,
-                    "path": str(path.relative_to(OUTPUT_DIR)),
+                    "path": path.relative_to(OUTPUT_DIR).as_posix(),
                     "size": dir_size,
                     "created": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
                 })
     return {"models": models}
 
 
-@app.get("/api/models/download/{name:path}")
-async def download_model(name: str):
-    """Download a trained model file or a zipped paraphernalia directory containing the 7 inference files."""
+def _resolve_model_path(name: str) -> Path:
     model_path = (OUTPUT_DIR / name).resolve()
-    # Security check: ensure path is inside OUTPUT_DIR
-    if not str(model_path).startswith(str(OUTPUT_DIR.resolve())):
+    if not _is_within(model_path, OUTPUT_DIR) or model_path == OUTPUT_DIR.resolve():
         raise HTTPException(status_code=403, detail="Access denied")
-
     if not model_path.exists():
         raise HTTPException(status_code=404, detail="Model not found")
+    return model_path
+
+
+@app.get("/api/models/download/{name:path}")
+def download_model(name: str):
+    """Download a model file, or a paraphernalia folder as a ZIP."""
+    model_path = _resolve_model_path(name)
 
     if model_path.is_dir():
-        # Zip the directory on the fly and send it
-        zip_path = BASE_DIR / f"{model_path.name}.zip"
+        fd, zip_path = tempfile.mkstemp(prefix=f"{model_path.name}_", suffix=".zip")
+        os.close(fd)
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             for root, dirs, files in os.walk(model_path):
                 for file in files:
                     file_path = Path(root) / file
-                    arcname = file_path.relative_to(model_path)
-                    zf.write(file_path, arcname)
-        
-        from fastapi import BackgroundTasks
-        def cleanup_temp_file(path_to_delete: str):
-            try:
-                os.remove(path_to_delete)
-            except:
-                pass
-        
-        bg_tasks = BackgroundTasks()
-        bg_tasks.add_task(cleanup_temp_file, str(zip_path))
-        
+                    zf.write(file_path, file_path.relative_to(model_path))
+        tasks = BackgroundTasks()
+        tasks.add_task(_remove_file, zip_path)
         return FileResponse(
-            path=str(zip_path), 
+            path=zip_path,
             filename=f"{model_path.name}.zip",
             media_type="application/zip",
-            background=bg_tasks
+            background=tasks,
         )
 
     return FileResponse(path=str(model_path), filename=model_path.name)
 
 
 @app.delete("/api/models/{name:path}")
-async def delete_model(name: str):
+def delete_model(name: str):
     """Delete a trained model file or paraphernalia directory."""
-    model_path = (OUTPUT_DIR / name).resolve()
-    # Security check: ensure path is inside OUTPUT_DIR
-    if not str(model_path).startswith(str(OUTPUT_DIR.resolve())):
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    if not model_path.exists():
-        raise HTTPException(status_code=404, detail="Model not found")
-
+    model_path = _resolve_model_path(name)
     try:
         if model_path.is_dir():
             shutil.rmtree(model_path)
@@ -1512,56 +1571,30 @@ async def delete_model(name: str):
 
 
 @app.post("/api/setup/beatrice")
-async def setup_beatrice():
-    """Clone or update the Beatrice trainer from HuggingFace using snapshot_download."""
+def setup_beatrice():
+    """Download (or update) the trainer's pretrained weights and audio assets from Hugging Face."""
+    _require_not_training("update the trainer")
     try:
-        from huggingface_hub import snapshot_download
-    except ImportError:
-        try:
-            subprocess.run([sys.executable, "-m", "pip", "install", "huggingface_hub"], check=True)
-            from huggingface_hub import snapshot_download
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"huggingface_hub library is not installed and failed to auto-install: {str(e)}"
-            )
-
-    try:
-        print("Downloading Beatrice trainer from Hugging Face...")
-        snapshot_download(
-            repo_id="fierce-cats/beatrice-trainer",
-            local_dir=str(BEATRICE_DIR),
-            allow_patterns=[
-                ".gitattributes",
-                ".gitignore",
-                "LICENSE",
-                "README.md",
-                "assets/README.md",
-                "assets/default_config.json",
-                "assets/images/*",
-                "assets/pretrained/*",
-                "assets/test/*",
-                "assets/ir/000*.flac",
-                "assets/noise/-*.flac",
-                "beatrice_trainer/*",
-                "pyproject.toml"
-            ],
-            max_workers=8
-        )
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        return {"message": "Beatrice trainer downloaded successfully via huggingface_hub"}
+        result = download_trainer_assets()
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to download Beatrice trainer: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to download Beatrice trainer assets: {e}")
+    missing = missing_trainer_modules()
+    message = "Beatrice trainer assets downloaded from Hugging Face."
+    if missing:
+        message += " Missing Python packages: " + ", ".join(missing) + " (re-run the start script)."
+    return {
+        "message": message,
+        "installed": not missing,
+        "beatrice_problems": trainer_setup_problems(),
+        **result,
+    }
 
 
 # --- Reset ---
 @app.post("/api/reset")
-async def reset_all():
+def reset_all():
     """Delete all datasets and models."""
+    _require_not_training("reset")
     if DATA_DIR.exists():
         shutil.rmtree(DATA_DIR)
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1573,30 +1606,96 @@ async def reset_all():
 
 # --- Static Frontend ---
 @app.get("/", response_class=HTMLResponse)
-async def serve_frontend():
+def serve_frontend():
     """Serve the main web UI."""
     index_path = BASE_DIR / "index.html"
     if index_path.exists():
-        return HTMLResponse(content=index_path.read_text(), status_code=200)
+        return HTMLResponse(content=index_path.read_text(encoding="utf-8"), status_code=200)
     return HTMLResponse(content="<h1>Beatrice V2 Trainer</h1><p>index.html not found</p>", status_code=200)
 
 app.mount("/", StaticFiles(directory=str(BASE_DIR), html=False), name="static")
 
 
 # ---------- Main ----------
+
+def run_setup_cli() -> int:
+    """`python server.py --setup`: used by the start scripts."""
+    print("Checking Beatrice trainer files ...")
+    try:
+        problems = trainer_asset_problems()
+        if problems:
+            for p in problems:
+                print(f"  - {p}")
+            download_trainer_assets()
+        else:
+            print("Trainer code, pretrained weights and assets are present.")
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return 1
+    missing = missing_trainer_modules()
+    if missing:
+        print("ERROR: missing Python packages: " + ", ".join(missing))
+        return 1
+    # find_spec() is not enough: e.g. pyworld fails at import time without pkg_resources.
+    for name in REQUIRED_TRAINER_MODULES:
+        try:
+            importlib.import_module(name)
+        except Exception as e:
+            print(f"ERROR: Python package '{name}' is installed but fails to import: {type(e).__name__}: {e}")
+            return 1
+    if sys.version_info < MIN_PYTHON:
+        print(f"ERROR: Python {sys.version.split()[0]} is too old for the trainer (needs 3.10 - 3.13).")
+        return 1
+    print("Trainer dependencies import correctly.")
+    return 0
+
+
+def _open_browser_when_ready(url: str, host: str, port: int):
+    def wait_and_open():
+        probe_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+        for _ in range(240):
+            try:
+                with socket.create_connection((probe_host, port), timeout=1):
+                    break
+            except OSError:
+                time.sleep(0.5)
+        webbrowser.open(url)
+    threading.Thread(target=wait_and_open, daemon=True).start()
+
+
 if __name__ == "__main__":
-    hw = get_mac_hardware_info()
-    print("=" * 55)
-    print("  🎙️  Beatrice V2 Trainer — Mac-Optimized Backend")
-    print("=" * 55)
-    print(f"  🍎 Chip:     {hw.get('gpu_name', hw['machine'])}")
-    print(f"  💾 RAM:      {hw['ram_total_gb']} GB {'(unified)' if hw['unified_memory'] else ''}")
-    print(f"  ⚡ Compute:  {hw['compute_backend'].upper()}" +
-          (" ✅" if hw["mps_available"] else " (MPS not available)"))
-    print(f"  🐍 PyTorch:  {hw.get('torch_version', 'not installed')}")
-    print(f"  📁 Data:     {DATA_DIR}")
-    print(f"  📦 Output:   {OUTPUT_DIR}")
-    print(f"  🌐 Web UI:   http://localhost:8000")
-    print(f"  📚 API docs: http://localhost:8000/docs")
-    print("=" * 55)
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Beatrice V2 Trainer web UI server")
+    parser.add_argument("--setup", action="store_true",
+                        help="download missing trainer weights/assets from Hugging Face, then exit")
+    parser.add_argument("--open-browser", action="store_true",
+                        help="open the web UI in the default browser once the server is up")
+    args = parser.parse_args()
+
+    if args.setup:
+        sys.exit(run_setup_cli())
+
+    hw = get_hardware_info()
+    url_host = "127.0.0.1" if HOST in ("0.0.0.0", "::") else HOST
+    url = f"http://{url_host}:{PORT}"
+    problems = trainer_setup_problems()
+    print("=" * 60)
+    print(f"  Beatrice V2 Trainer - {PLATFORM_LABEL} backend")
+    print("=" * 60)
+    print(f"  Chip:      {hw.get('gpu_name') or hw['machine']}")
+    print(f"  RAM:       {hw['ram_total_gb']} GB {'(unified)' if hw['unified_memory'] else ''}")
+    print(f"  Compute:   {hw['compute_backend'].upper()}" +
+          ("" if hw["mps_available"] else " (MPS not available)"))
+    print(f"  PyTorch:   {hw.get('torch_version') or 'not installed'}")
+    print(f"  Trainer:   {'ready' if not problems else 'NOT READY - ' + '; '.join(problems)}")
+    print(f"  Data:      {DATA_DIR}")
+    print(f"  Output:    {OUTPUT_DIR}")
+    print(f"  Web UI:    {url}")
+    print(f"  API docs:  {url}/docs")
+    if HOST not in LOOPBACK_HOSTS:
+        print(f"  WARNING:   listening on {HOST} - anyone on your network can use this trainer")
+    print("=" * 60, flush=True)
+    if args.open_browser:
+        _open_browser_when_ready(url, HOST, PORT)
+    uvicorn.run(app, host=HOST, port=PORT, log_level="info")

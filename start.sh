@@ -1,64 +1,86 @@
 #!/bin/bash
 # =============================================
-#  Beatrice V2 Trainer — Mac Startup Script
+#  Beatrice V2 Trainer - macOS start script
 # =============================================
+#  1. finds Python 3.10-3.13 and creates ./venv
+#  2. installs requirements.txt (web server + PyTorch + trainer dependencies)
+#  3. downloads the trainer's pretrained weights and audio assets from
+#     Hugging Face (fierce-cats/beatrice-trainer) if they are missing
+#  4. starts the server on http://127.0.0.1:8000 and opens the browser
+#     (set BEATRICE_NO_BROWSER=1 to skip opening the browser)
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "============================================="
-echo "  🎙️  Beatrice V2 Trainer for Mac"
+echo "  Beatrice V2 Trainer for Mac"
 echo "============================================="
 echo ""
 
-# Check Python
-if command -v python3 &> /dev/null; then
-    PYTHON=python3
-elif command -v python &> /dev/null; then
-    PYTHON=python
-else
-    echo "❌ Python 3 is required but not found."
-    echo "   Install it from https://www.python.org/downloads/"
+# --- 1. Python ---
+PYTHON=""
+# The trainer needs Python >= 3.10 (its UTMOS quality model uses 3.10 syntax);
+# PyTorch < 2.9 (required by torchaudio < 2.9) has no wheels for 3.14.
+PY_OK='import sys; sys.exit(0 if (3, 10) <= sys.version_info[:2] <= (3, 13) else 1)'
+for candidate in python3.12 python3.11 python3.13 python3.10 python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c "$PY_OK" >/dev/null 2>&1; then
+        PYTHON="$candidate"
+        break
+    fi
+done
+if [ -z "$PYTHON" ]; then
+    echo "[ERROR] Python 3.10 - 3.13 is required but was not found."
+    echo "        (macOS ships Python 3.9, which is too old for the trainer.)"
+    echo "        Install Python 3.12 from https://www.python.org/downloads/"
+    echo "        or with Homebrew: brew install python@3.12"
+    exit 1
+fi
+echo "Using Python: $("$PYTHON" --version 2>&1) ($(command -v "$PYTHON"))"
+
+# --- 2. Virtual environment ---
+if [ -d "venv" ] && ! venv/bin/python -c "$PY_OK" >/dev/null 2>&1; then
+    echo "The existing venv is broken or uses an unsupported Python - recreating it..."
+    rm -rf venv
+fi
+if [ ! -d "venv" ]; then
+    echo ""
+    echo "Creating virtual environment..."
+    "$PYTHON" -m venv venv
+fi
+# shellcheck disable=SC1091
+source venv/bin/activate
+
+echo "Installing dependencies (the first run downloads PyTorch, several hundred MB)..."
+python -m pip install -q --upgrade pip
+if ! python -m pip install -q -r requirements.txt; then
+    echo ""
+    echo "[ERROR] Installing requirements.txt failed (see the messages above)."
+    echo "        pyworld is compiled during install and needs the Xcode command line tools:"
+    echo "            xcode-select --install"
     exit 1
 fi
 
-echo "✅ Using Python: $($PYTHON --version)"
-
-# Create virtual environment if needed
-if [ ! -d "venv" ]; then
+# --- 3. Trainer weights / assets ---
+mkdir -p beatrice-trainer/data beatrice-trainer/output
+if ! python server.py --setup; then
     echo ""
-    echo "📦 Creating virtual environment..."
-    $PYTHON -m venv venv
+    echo "[WARNING] The trainer is not ready (see the error above): its weights could not be"
+    echo "          downloaded or a dependency failed to import. Training stays unavailable"
+    echo "          until this is fixed. Re-run ./start.sh, or use 'Download or update trainer'"
+    echo "          in Settings for download problems."
 fi
 
-# Activate venv
-source venv/bin/activate
-
-# Install dependencies
-echo "📦 Installing dependencies..."
-pip install -q -r requirements.txt
-
-# Download Beatrice trainer if needed
-if [ ! -d "beatrice-trainer" ] || [ ! -f "beatrice-trainer/beatrice_trainer/__main__.py" ]; then
-    echo ""
-    echo "📥 Downloading Beatrice Trainer from HuggingFace..."
-    python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='fierce-cats/beatrice-trainer', local_dir='beatrice-trainer', allow_patterns=['.gitattributes', '.gitignore', 'LICENSE', 'README.md', 'assets/README.md', 'assets/default_config.json', 'assets/images/*', 'assets/pretrained/*', 'assets/test/*', 'assets/ir/000*.flac', 'assets/noise/-*.flac', 'beatrice_trainer/*', 'pyproject.toml'])"
-    echo "✅ Beatrice Trainer downloaded."
-fi
-
-# Ensure data directories exist
-mkdir -p beatrice-trainer/data
-mkdir -p beatrice-trainer/output
-
+# --- 4. Server ---
 echo ""
 echo "============================================="
-echo "  🚀 Starting server on http://localhost:8000"
+echo "  Starting server on http://127.0.0.1:8000"
+echo "  Press Ctrl+C to stop."
 echo "============================================="
 echo ""
 
-# Open browser after a short delay
-(sleep 2 && open "http://localhost:8000" 2>/dev/null || xdg-open "http://localhost:8000" 2>/dev/null) &
-
-# Start the server (serves both API and static frontend)
-$PYTHON server.py
+if [ -n "$BEATRICE_NO_BROWSER" ]; then
+    exec python server.py
+else
+    exec python server.py --open-browser
+fi

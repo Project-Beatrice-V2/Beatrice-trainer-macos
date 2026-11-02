@@ -5,20 +5,32 @@ __pycache__/
 
 # Environment
 venv/
+.venv/
 ENV/
 env/
 .env
 
-# Large datasets & downloaded dependencies
+# Trainer runtime data: datasets, trained models, per-run files
 beatrice-trainer/data/
 beatrice-trainer/output/
 beatrice-trainer/data_active/
+beatrice-trainer/work/
 beatrice-trainer/.cache/
 beatrice-trainer/__pycache__/
 beatrice-trainer/*.log
-beatrice-trainer/test_training_status.json
+
+# Trainer weights and audio assets, downloaded from Hugging Face
+# (fierce-cats/beatrice-trainer) by start.sh / `python server.py --setup`
+beatrice-trainer/assets/pretrained/
+beatrice-trainer/assets/ir/
+beatrice-trainer/assets/noise/
+beatrice-trainer/assets/test/
+beatrice-trainer/assets/images/
+
+# Generated archives and temp folders
 temp_clone/
 beatrice_dataset.zip
+paraphernalia_*.zip
 
 # Logs
 *.log
